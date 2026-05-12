@@ -27,6 +27,9 @@ WATCHERS_PATH = os.path.join(CALLBACK_DIR, "watchers.json")
 WATCHERS_LOCK_PATH = os.path.join(CALLBACK_DIR, "watchers.lock")
 OUTBOX_DIR = os.path.join(CALLBACK_DIR, "outbox")
 BATCH_LOCK_DIR = os.path.join(CONFIG_DIR, "batch-locks")
+SUPERVISION_DIR = os.path.join(CONFIG_DIR, "supervision")
+SUPERVISION_LEASES_PATH = os.path.join(SUPERVISION_DIR, "leases.json")
+SUPERVISION_LOCK_PATH = os.path.join(SUPERVISION_DIR, "leases.lock")
 DEFAULT_ENDPOINT = "http://127.0.0.1:8765/jsonrpc.php"
 DEFAULT_REPO_ROOTS = ["~/Dropbox/work/MyTools"]   # searched for a <project> subdir by `dispatch`
 DUP_MIN_LEN = 12                                  # min substring/title length to count as a "strong" duplicate
@@ -37,6 +40,7 @@ DEFAULT_SUPERVISE_MAX_POLLS = 120
 DEFAULT_WATCH_EXPIRES_HOURS = 72
 CALLBACK_DELIVERING_STALE_SECONDS = 300
 DEFAULT_BATCH_SESSION_PREFIX = "batch-owner"
+DEFAULT_SUPERVISION_TTL_HOURS = 6
 
 KIND_CHOICES = ["bug", "friction", "request", "blocker", "question", "idea", "regression"]
 SEVERITY_CHOICES = ["p1", "p2", "p3"]
@@ -625,6 +629,389 @@ def _unlock_batch_repo(fd):
         os.close(fd)
 
 
+# ---- durable supervision claims -------------------------------------------
+
+def _ensure_supervision_dir():
+    os.makedirs(SUPERVISION_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(SUPERVISION_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _lock_supervision_store():
+    _ensure_supervision_dir()
+    try:
+        fd = os.open(SUPERVISION_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(SUPERVISION_LOCK_PATH, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError as e:
+        sys.exit("agent-ticket: couldn't lock supervision claim store %s (%s)" % (SUPERVISION_LOCK_PATH, e))
+
+
+def _unlock_supervision_store(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _load_supervision_store(strict=False):
+    data, err = _read_json(SUPERVISION_LEASES_PATH)
+    if data is None:
+        if strict and err != "missing":
+            sys.exit("agent-ticket: supervision claim store %s is unreadable (%s)" % (SUPERVISION_LEASES_PATH, err))
+        return {"version": 1, "claims": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("claims"), dict):
+        if strict:
+            sys.exit("agent-ticket: supervision claim store %s has an invalid schema" % SUPERVISION_LEASES_PATH)
+        return {"version": 1, "claims": {}}
+    data.setdefault("version", 1)
+    return data
+
+
+def _save_supervision_store(store):
+    _ensure_supervision_dir()
+    store.setdefault("version", 1)
+    store.setdefault("claims", {})
+    tmp = "%s.tmp.%s" % (SUPERVISION_LEASES_PATH, os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            json.dump(store, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SUPERVISION_LEASES_PATH)
+        try:
+            os.chmod(SUPERVISION_LEASES_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        sys.exit("agent-ticket: couldn't write supervision claim store %s (%s)" % (SUPERVISION_LEASES_PATH, e))
+
+
+def _canonical_repo_path(repo):
+    return os.path.realpath(os.path.expanduser(str(repo)))
+
+
+def _repo_claim_key(repo):
+    return hashlib.sha256(_canonical_repo_path(repo).encode("utf-8")).hexdigest()[:24]
+
+
+def _supervision_ticket_ids(ticket_ids):
+    return sorted({int(tid) for tid in (ticket_ids or [])})
+
+
+def _supervision_owner_id(args):
+    explicit = getattr(args, "supervisor_id", None) or os.environ.get("AGENT_TICKETS_SUPERVISOR_ID")
+    if explicit:
+        return _san(str(explicit)).strip()[:160] or "unknown-supervisor"
+    try:
+        host = os.uname().nodename
+    except AttributeError:
+        host = "host"
+    return "pid:%s:%d" % (_safe_file_component(host), os.getpid())
+
+
+def _supervision_ttl_seconds(args):
+    hours = float(getattr(args, "supervision_ttl_hours", DEFAULT_SUPERVISION_TTL_HOURS)
+                  or DEFAULT_SUPERVISION_TTL_HOURS)
+    if hours <= 0:
+        sys.exit("agent-ticket: --supervision-ttl-hours must be greater than zero")
+    return hours * 3600.0
+
+
+def _supervision_origin_metadata(args):
+    origin_repo = (
+        getattr(args, "origin_repo", None)
+        or os.environ.get("AGENT_TICKETS_ORIGIN_REPO")
+        or _current_origin_repo()
+    )
+    origin_repo = _canonical_repo_path(origin_repo)
+    provider = getattr(args, "origin_provider", None) or os.environ.get("AGENT_TICKETS_ORIGIN_PROVIDER") or None
+    if provider and provider not in DISPATCH_PROVIDERS:
+        sys.exit("agent-ticket: origin provider %r is not supported (expected one of: %s)"
+                 % (provider, ", ".join(DISPATCH_PROVIDERS)))
+    session = getattr(args, "origin_session", None) or os.environ.get("AGENT_TICKETS_ORIGIN_SESSION") or None
+    return {"origin_repo": origin_repo, "origin_provider": provider, "origin_session": session}
+
+
+def _claim_is_active(claim, now=None):
+    now = time.time() if now is None else now
+    expires_at = claim.get("expires_at_epoch")
+    try:
+        return expires_at is not None and float(expires_at) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def _claim_overlaps(claim, repo, ticket_ids):
+    canonical_repo = _canonical_repo_path(repo)
+    if _canonical_repo_path(claim.get("repo") or "") == canonical_repo:
+        return True
+    wanted = set(_supervision_ticket_ids(ticket_ids))
+    have = set(_supervision_ticket_ids(claim.get("ticket_ids") or []))
+    return bool(wanted & have)
+
+
+def _public_supervision_claim(claim, owner_id=None, now=None):
+    now = time.time() if now is None else now
+    updated = claim.get("last_heartbeat_epoch") or claim.get("updated_at_epoch") or claim.get("created_at_epoch") or now
+    expires = claim.get("expires_at_epoch")
+    active = _claim_is_active(claim, now)
+    public = {
+        "claim_id": claim.get("claim_id"),
+        "repo": claim.get("repo"),
+        "project": claim.get("project"),
+        "projects": list(claim.get("projects") or []),
+        "ticket_ids": _supervision_ticket_ids(claim.get("ticket_ids") or []),
+        "command": claim.get("command"),
+        "owner_id": claim.get("owner_id"),
+        "origin_provider": claim.get("origin_provider"),
+        "origin_repo": claim.get("origin_repo"),
+        "origin_session": claim.get("origin_session"),
+        "worker_provider": claim.get("worker_provider"),
+        "worker_session": claim.get("worker_session"),
+        "worker_mode": claim.get("worker_mode"),
+        "created_at": claim.get("created_at"),
+        "updated_at": claim.get("updated_at"),
+        "last_heartbeat_at": claim.get("last_heartbeat_at"),
+        "expires_at": claim.get("expires_at"),
+        "active": active,
+        "stale": not active,
+        "owned_by_current": bool(owner_id and claim.get("owner_id") == owner_id),
+        "age_seconds": max(0, int(now - float(updated))),
+        "expires_in_seconds": int(float(expires) - now) if expires is not None else None,
+        "heartbeat_count": int(claim.get("heartbeat_count") or 0),
+    }
+    return public
+
+
+def _supervision_matching_claims(store, claim_id=None, repo=None, ticket=None, include_all=True, now=None):
+    now = time.time() if now is None else now
+    repo = _canonical_repo_path(repo) if repo else None
+    result = []
+    for claim in (store.get("claims") or {}).values():
+        if claim_id and claim.get("claim_id") != claim_id:
+            continue
+        if repo and _canonical_repo_path(claim.get("repo") or "") != repo:
+            continue
+        if ticket is not None and int(ticket) not in _supervision_ticket_ids(claim.get("ticket_ids") or []):
+            continue
+        if not include_all and not _claim_is_active(claim, now):
+            continue
+        result.append(claim)
+    return sorted(result, key=lambda c: (c.get("repo") or "", c.get("claim_id") or ""))
+
+
+def _supervision_preflight(args, repo, ticket_ids):
+    owner_id = _supervision_owner_id(args)
+    now = time.time()
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        matching = [
+            claim for claim in (store.get("claims") or {}).values()
+            if _claim_overlaps(claim, repo, ticket_ids)
+        ]
+        active = [claim for claim in matching if _claim_is_active(claim, now)]
+        other_active = [claim for claim in active if claim.get("owner_id") != owner_id]
+        own_active = [claim for claim in active if claim.get("owner_id") == owner_id]
+        stale = [claim for claim in matching if not _claim_is_active(claim, now)]
+    finally:
+        _unlock_supervision_store(fd)
+    return {
+        "owner_id": owner_id,
+        "blocked": bool(other_active and not getattr(args, "force_supervision", False)),
+        "active_claims": [_public_supervision_claim(c, owner_id, now) for c in active],
+        "conflicting_claims": [_public_supervision_claim(c, owner_id, now) for c in other_active],
+        "owned_claims": [_public_supervision_claim(c, owner_id, now) for c in own_active],
+        "stale_claims": [_public_supervision_claim(c, owner_id, now) for c in stale],
+        "override": bool(other_active and getattr(args, "force_supervision", False)),
+    }
+
+
+def _supervision_claim_detail(claims):
+    parts = []
+    for claim in claims:
+        parts.append(
+            "claim %s owner=%s repo=%s tickets=%s worker=%s/%s last_heartbeat=%s expires=%s"
+            % (
+                claim.get("claim_id"),
+                claim.get("owner_id"),
+                claim.get("repo"),
+                ",".join(str(t) for t in claim.get("ticket_ids") or []),
+                claim.get("worker_provider") or "-",
+                claim.get("worker_session") or "-",
+                claim.get("last_heartbeat_at") or claim.get("updated_at") or "-",
+                claim.get("expires_at") or "-",
+            )
+        )
+    return "; ".join(parts) or "active supervision claim exists"
+
+
+def _supervision_claim_id(repo, ticket_ids, owner_id):
+    payload = "%s\n%s\n%s" % (
+        _canonical_repo_path(repo),
+        ",".join(str(t) for t in _supervision_ticket_ids(ticket_ids)),
+        owner_id,
+    )
+    return "claim-%s" % hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _route_worker_fields(route):
+    route = route or {}
+    return {
+        "worker_provider": route.get("provider"),
+        "worker_session": route.get("session"),
+        "worker_mode": route.get("mode"),
+    }
+
+
+def _build_supervision_claim(args, command, repo, project, projects, ticket_ids, route=None, existing=None, now=None):
+    now = time.time() if now is None else now
+    owner_id = _supervision_owner_id(args)
+    ttl = _supervision_ttl_seconds(args)
+    existing = existing or {}
+    prior_tickets = _supervision_ticket_ids(existing.get("ticket_ids") or [])
+    tickets = _supervision_ticket_ids(prior_tickets + _supervision_ticket_ids(ticket_ids))
+    claim_id = existing.get("claim_id") or _supervision_claim_id(repo, tickets, owner_id)
+    created_epoch = float(existing.get("created_at_epoch") or now)
+    origin = _supervision_origin_metadata(args)
+    claim = {
+        "claim_id": claim_id,
+        "repo": _canonical_repo_path(repo),
+        "repo_key": _repo_claim_key(repo),
+        "project": project,
+        "projects": sorted(set(projects or ([project] if project else []))),
+        "ticket_ids": tickets,
+        "command": command,
+        "owner_id": owner_id,
+        "pid": os.getpid(),
+        "created_at": existing.get("created_at") or _utc_iso(created_epoch),
+        "created_at_epoch": created_epoch,
+        "updated_at": _utc_iso(now),
+        "updated_at_epoch": now,
+        "last_heartbeat_at": _utc_iso(now),
+        "last_heartbeat_epoch": now,
+        "expires_at": _utc_iso(now + ttl),
+        "expires_at_epoch": now + ttl,
+        "ttl_seconds": ttl,
+        "heartbeat_count": int(existing.get("heartbeat_count") or 0) + 1,
+    }
+    claim.update(origin)
+    claim.update(_route_worker_fields(route))
+    return claim
+
+
+def _find_owned_overlapping_claim(store, repo, ticket_ids, owner_id, include_stale=False):
+    now = time.time()
+    for claim in (store.get("claims") or {}).values():
+        if claim.get("owner_id") == owner_id and _claim_overlaps(claim, repo, ticket_ids) and _claim_is_active(claim, now):
+            return claim
+    if include_stale:
+        for claim in (store.get("claims") or {}).values():
+            if _claim_overlaps(claim, repo, ticket_ids) and not _claim_is_active(claim, now):
+                return claim
+    return None
+
+
+def _acquire_supervision_claim(args, command, repo, project, projects, ticket_ids, route=None):
+    owner_id = _supervision_owner_id(args)
+    now = time.time()
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        matching = [
+            claim for claim in (store.get("claims") or {}).values()
+            if _claim_overlaps(claim, repo, ticket_ids) and _claim_is_active(claim, now)
+        ]
+        other_active = [claim for claim in matching if claim.get("owner_id") != owner_id]
+        if other_active and not getattr(args, "force_supervision", False):
+            return None, [_public_supervision_claim(c, owner_id, now) for c in other_active]
+        if other_active and getattr(args, "force_supervision", False):
+            for claim in other_active:
+                store["claims"].pop(claim.get("claim_id"), None)
+        existing = _find_owned_overlapping_claim(
+            store, repo, ticket_ids, owner_id,
+            include_stale=bool(getattr(args, "adopt_supervision", False) or getattr(args, "steal_supervision", False)),
+        )
+        claim = _build_supervision_claim(args, command, repo, project, projects, ticket_ids, route=route, existing=existing, now=now)
+        store["claims"][claim["claim_id"]] = claim
+        _save_supervision_store(store)
+        return claim, []
+    finally:
+        _unlock_supervision_store(fd)
+
+
+def _update_supervision_route(claim_id, route):
+    if not claim_id:
+        return None
+    now = time.time()
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        claim = (store.get("claims") or {}).get(claim_id)
+        if not claim:
+            return None
+        claim.update(_route_worker_fields(route))
+        claim["updated_at"] = _utc_iso(now)
+        claim["updated_at_epoch"] = now
+        store["claims"][claim_id] = claim
+        _save_supervision_store(store)
+        return claim
+    finally:
+        _unlock_supervision_store(fd)
+
+
+def _heartbeat_supervision_claim(claim_id):
+    if not claim_id:
+        return None
+    now = time.time()
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        claim = (store.get("claims") or {}).get(claim_id)
+        if not claim:
+            return None
+        ttl = float(claim.get("ttl_seconds") or DEFAULT_SUPERVISION_TTL_HOURS * 3600.0)
+        claim["updated_at"] = _utc_iso(now)
+        claim["updated_at_epoch"] = now
+        claim["last_heartbeat_at"] = _utc_iso(now)
+        claim["last_heartbeat_epoch"] = now
+        claim["expires_at"] = _utc_iso(now + ttl)
+        claim["expires_at_epoch"] = now + ttl
+        claim["heartbeat_count"] = int(claim.get("heartbeat_count") or 0) + 1
+        store["claims"][claim_id] = claim
+        _save_supervision_store(store)
+        return claim
+    finally:
+        _unlock_supervision_store(fd)
+
+
+def _release_supervision_claim(claim_id):
+    if not claim_id:
+        return None
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        claim = (store.get("claims") or {}).pop(claim_id, None)
+        if claim:
+            _save_supervision_store(store)
+        return claim
+    finally:
+        _unlock_supervision_store(fd)
+
+
 def _event_path(event_key):
     return os.path.join(OUTBOX_DIR, _safe_file_component(event_key) + ".json")
 
@@ -1189,6 +1576,107 @@ def cmd_callbacks(cfg, args):
         if r.get("status") != "delivered":
             print("  Run `agent-ticket closeout-check %s --strict` before resuming the original task." % r["ticket_id"])
             print("  Then acknowledge with `agent-ticket callbacks ack %s`." % r["event_key"])
+
+
+def _format_supervision_status(claims):
+    if not claims:
+        return "(no supervision claims)"
+    lines = []
+    for claim in claims:
+        state = "active" if claim.get("active") else "stale"
+        owner = "owned" if claim.get("owned_by_current") else "other"
+        lines.append(
+            "%s %s (%s): repo=%s tickets=%s owner=%s worker=%s/%s last_heartbeat=%s expires=%s"
+            % (
+                claim.get("claim_id"),
+                state,
+                owner,
+                claim.get("repo"),
+                ",".join(str(t) for t in claim.get("ticket_ids") or []),
+                claim.get("owner_id"),
+                claim.get("worker_provider") or "-",
+                claim.get("worker_session") or "-",
+                claim.get("last_heartbeat_at") or "-",
+                claim.get("expires_at") or "-",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _supervision_command_requires_filter(args):
+    return not (getattr(args, "claim", None) or getattr(args, "repo", None)
+                or getattr(args, "ticket", None) is not None or getattr(args, "all", False))
+
+
+def cmd_supervision(cfg, args):
+    owner_id = _supervision_owner_id(args)
+    now = time.time()
+    action = args.action
+    fd = _lock_supervision_store()
+    try:
+        store = _load_supervision_store(strict=True)
+        matches = _supervision_matching_claims(
+            store,
+            claim_id=getattr(args, "claim", None),
+            repo=getattr(args, "repo", None),
+            ticket=getattr(args, "ticket", None),
+            include_all=(not getattr(args, "active_only", False)) if action == "status" else True,
+            now=now,
+        )
+        if action == "status":
+            public = [_public_supervision_claim(c, owner_id, now) for c in matches]
+            out(args, {"ok": True, "claims": public}, _format_supervision_status(public))
+            return
+        if _supervision_command_requires_filter(args):
+            sys.exit("agent-ticket: supervision %s requires --claim, --repo, --ticket, or --all" % action)
+
+        changed = []
+        blocked = []
+        for claim in matches:
+            public = _public_supervision_claim(claim, owner_id, now)
+            allowed = public["owned_by_current"] or public["stale"] or bool(getattr(args, "force", False))
+            if not allowed:
+                blocked.append(public)
+                continue
+            if action == "release":
+                store["claims"].pop(claim.get("claim_id"), None)
+                changed.append(public)
+                continue
+            if action not in ("adopt", "steal"):
+                sys.exit("agent-ticket: unknown supervision action %r" % action)
+            ttl = _supervision_ttl_seconds(args)
+            origin = _supervision_origin_metadata(args)
+            claim["owner_id"] = owner_id
+            claim["command"] = "supervision %s" % action
+            claim["pid"] = os.getpid()
+            claim.update(origin)
+            claim["updated_at"] = _utc_iso(now)
+            claim["updated_at_epoch"] = now
+            claim["last_heartbeat_at"] = _utc_iso(now)
+            claim["last_heartbeat_epoch"] = now
+            claim["expires_at"] = _utc_iso(now + ttl)
+            claim["expires_at_epoch"] = now + ttl
+            claim["ttl_seconds"] = ttl
+            claim["heartbeat_count"] = int(claim.get("heartbeat_count") or 0) + 1
+            store["claims"][claim["claim_id"]] = claim
+            changed.append(_public_supervision_claim(claim, owner_id, now))
+
+        if changed or blocked:
+            _save_supervision_store(store)
+        result = {
+            "ok": not blocked,
+            "action": action,
+            "claims": changed,
+            "blocked": blocked,
+        }
+    finally:
+        _unlock_supervision_store(fd)
+    human = "supervision %s: %d claim(s)%s" % (
+        action,
+        len(result["claims"]),
+        ", %d blocked" % len(result["blocked"]) if result["blocked"] else "",
+    )
+    out(args, result, human)
 
 
 # ---- dispatch helpers ----------------------------------------------------
@@ -2198,6 +2686,24 @@ def _batch_select_route(args, group, message):
 
 def _batch_route_group(cfg, args, group):
     original_group = group
+    ticket_ids = [ticket["id"] for ticket in group.get("tickets", [])]
+    supervision_preflight = _supervision_preflight(args, group["repo"], ticket_ids)
+    if supervision_preflight["blocked"]:
+        active = supervision_preflight["conflicting_claims"]
+        return {
+            "project": group["project"],
+            "repo": group["repo"],
+            "tickets": group["tickets"],
+            "route": {
+                "status": "blocked",
+                "reason": "already supervised",
+                "detail": _supervision_claim_detail(active),
+                "active_supervision": active,
+            },
+            "status": "blocked",
+            "closeouts": {},
+            "supervision": supervision_preflight,
+        }
     group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group)
     if stale_reason:
         return {
@@ -2217,6 +2723,7 @@ def _batch_route_group(cfg, args, group):
         "route": route,
         "status": "planned" if getattr(args, "dry_run", False) and route.get("status") == "planned" else route.get("status"),
         "closeouts": {},
+        "supervision": supervision_preflight,
     }
     if getattr(args, "dry_run", False) or route.get("status") == "blocked":
         return result
@@ -2251,16 +2758,34 @@ def _batch_route_group(cfg, args, group):
         result["project"] = group["project"]
         message = _batch_supervision_message(cfg, group, args)
         session = route.get("session")
+        claim, conflicts = _acquire_supervision_claim(
+            args, "supervise-batch", group["repo"], group["project"], group.get("projects", []),
+            [ticket["id"] for ticket in group.get("tickets", [])], route=route)
+        if conflicts:
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "already supervised"
+            route["detail"] = _supervision_claim_detail(conflicts)
+            route["active_supervision"] = conflicts
+            return result
+        claim_id = claim["claim_id"]
+        result["_supervision_claim_id"] = claim_id
+        result["supervision"] = _public_supervision_claim(claim, _supervision_owner_id(args))
         send = _agent_contact(group["repo"], route["provider"], message, dry_run=False,
                               session=None if session == "(auto-discovered)" else session)
         route["send"] = send.get("json") or send.get("raw")
         if not send.get("ok"):
+            _release_supervision_claim(claim_id)
+            result.pop("_supervision_claim_id", None)
             result["status"] = "blocked"
             route["status"] = "blocked"
             route["reason"] = "send refused"
             route["detail"] = _probe_reason(send)
             return result
         route["session"] = ((send.get("json") or {}).get("session")) or session or "(auto-discovered)"
+        updated_claim = _update_supervision_route(claim_id, route)
+        if updated_claim:
+            result["supervision"] = _public_supervision_claim(updated_claim, _supervision_owner_id(args))
     else:
         group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group, context="launch")
         if stale_reason:
@@ -2288,9 +2813,24 @@ def _batch_route_group(cfg, args, group):
             ) if prelaunch_existing.get("ok") else prelaunch_block.get("detail")
             route["existing"] = prelaunch_existing
             return result
+        claim, conflicts = _acquire_supervision_claim(
+            args, "supervise-batch", group["repo"], group["project"], group.get("projects", []),
+            [ticket["id"] for ticket in group.get("tickets", [])], route=route)
+        if conflicts:
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "already supervised"
+            route["detail"] = _supervision_claim_detail(conflicts)
+            route["active_supervision"] = conflicts
+            return result
+        claim_id = claim["claim_id"]
+        result["_supervision_claim_id"] = claim_id
+        result["supervision"] = _public_supervision_claim(claim, _supervision_owner_id(args))
         launch = _agent_tmux([cmd_name, route["session"], group["repo"], message], timeout=60)
         route["launch"] = launch
         if not launch.get("ok"):
+            _release_supervision_claim(claim_id)
+            result.pop("_supervision_claim_id", None)
             result["status"] = "blocked"
             route["status"] = "blocked"
             route["reason"] = "agent-tmux launch failed"
@@ -2391,6 +2931,7 @@ def _batch_route_groups(cfg, args, groups):
 def _batch_release_route_locks(results):
     released = set()
     for result in results:
+        result.pop("_supervision_claim_id", None)
         fd = result.pop("_repo_lock_fd", None)
         if fd is None or fd in released:
             continue
@@ -2412,8 +2953,20 @@ def _batch_poll_closeouts(cfg, args, results):
     }
     if not routed_ticket_ids:
         return ticket_status
+    claim_ids = sorted({
+        result.get("_supervision_claim_id")
+        for result in results
+        if _batch_group_was_routed(result) and result.get("_supervision_claim_id")
+    })
 
     for poll in range(int(args.max_polls) + 1):
+        for claim_id in claim_ids:
+            updated = _heartbeat_supervision_claim(claim_id)
+            if not updated:
+                continue
+            for result in results:
+                if result.get("_supervision_claim_id") == claim_id:
+                    result["supervision"] = _public_supervision_claim(updated, _supervision_owner_id(args))
         remaining = set()
         for result in results:
             if not _batch_group_was_routed(result):
@@ -2446,6 +2999,22 @@ def _batch_poll_closeouts(cfg, args, results):
             break
         time.sleep(args.poll_interval)
     return ticket_status
+
+
+def _batch_release_completed_supervision_claims(args, results, ticket_status):
+    for result in results:
+        claim_id = result.get("_supervision_claim_id")
+        if not claim_id:
+            continue
+        ticket_ids = [int(ticket["id"]) for ticket in result.get("tickets", [])]
+        if not ticket_ids:
+            continue
+        states = [ticket_status.get(tid, {}) for tid in ticket_ids]
+        if states and all(state.get("status") in ("closed", "needs_human") for state in states):
+            released = _release_supervision_claim(claim_id)
+            if released:
+                result["supervision_released"] = True
+                result["supervision"] = _public_supervision_claim(released, _supervision_owner_id(args))
 
 
 def _format_supervise_batch_result(result):
@@ -2504,6 +3073,7 @@ def cmd_supervise_batch(cfg, args):
     try:
         if not getattr(args, "dry_run", False):
             ticket_status = _batch_poll_closeouts(cfg, args, routed)
+            _batch_release_completed_supervision_claims(args, routed, ticket_status)
     finally:
         _batch_release_route_locks(routed)
     for group in routed:
@@ -2598,6 +3168,19 @@ def cmd_supervise(cfg, args):
         out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
         return
 
+    supervision_preflight = _supervision_preflight(args, repo, [args.id])
+    if supervision_preflight["blocked"]:
+        active = supervision_preflight["conflicting_claims"]
+        result = {
+            "ok": False,
+            "status": "blocked",
+            "reason": "already supervised",
+            "detail": _supervision_claim_detail(active),
+            "active_supervision": active,
+        }
+        out(args, result, "supervise #%s blocked: already supervised (%s)" % (args.id, result["detail"]))
+        return
+
     message = _supervision_message(cfg, args.id, pname, title, args)
     providers = [args.provider] if args.provider else DISPATCH_PROVIDERS
     contactable, refused = _contactable_providers(repo, message, session=args.session, providers=providers)
@@ -2647,12 +3230,27 @@ def cmd_supervise(cfg, args):
         watcher_preview = _origin_watcher_record(args.id, args, "supervise")
     if args.dry_run:
         result = {"ok": True, "dry_run": True, "route": route, "refused": refused}
+        result["supervision"] = supervision_preflight
         if watcher_preview:
             result["watcher"] = watcher_preview
         out(args, result,
             "supervise #%s dry-run: %s %s session %s for %s" % (
                 args.id, route["mode"], route["provider"], route["session"], repo))
         return
+    claim, conflicts = _acquire_supervision_claim(
+        args, "supervise", repo, pname, [pname], [args.id], route=route)
+    if conflicts:
+        result = {
+            "ok": False,
+            "status": "blocked",
+            "reason": "already supervised",
+            "detail": _supervision_claim_detail(conflicts),
+            "active_supervision": conflicts,
+        }
+        out(args, result, "supervise #%s blocked: already supervised (%s)" % (args.id, result["detail"]))
+        return
+    claim_id = claim["claim_id"]
+    route["supervision"] = _public_supervision_claim(claim, _supervision_owner_id(args))
     watcher = _register_origin_watcher(cfg, args.id, args, "supervise")
     if watcher:
         route["watcher"] = watcher
@@ -2660,10 +3258,17 @@ def cmd_supervise(cfg, args):
     if selected["mode"] == "contact":
         send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=selected.get("session"))
         if not send.get("ok"):
+            _release_supervision_claim(claim_id)
             result = _supervision_blocked(cfg, args, "send refused", _probe_reason(send), args.id)
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
         route["sent"] = send.get("json") or send.get("raw")
+        sent_session = ((send.get("json") or {}).get("session")) or route.get("session")
+        if sent_session:
+            route["session"] = sent_session
+            updated_claim = _update_supervision_route(claim_id, route)
+            if updated_claim:
+                route["supervision"] = _public_supervision_claim(updated_claim, _supervision_owner_id(args))
     else:
         cmd = ["codex-resume-latest" if selected["mode"] == "resume-latest" else "codex", route["session"], repo]
         if args.full_permission:
@@ -2672,6 +3277,7 @@ def cmd_supervise(cfg, args):
         launch = _agent_tmux(cmd, timeout=60)
         route["launch"] = launch
         if not launch.get("ok"):
+            _release_supervision_claim(claim_id)
             result = _supervision_blocked(cfg, args, "agent-tmux launch failed",
                                           "%s\n%s" % (launch.get("stderr", ""), launch.get("stdout", "")), args.id)
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
@@ -2687,9 +3293,14 @@ def cmd_supervise(cfg, args):
 
     final_report = None
     for poll in range(args.max_polls + 1):
+        updated_claim = _heartbeat_supervision_claim(claim_id)
+        if updated_claim:
+            route["supervision"] = _public_supervision_claim(updated_claim, _supervision_owner_id(args))
         current = get_task_in_project(cfg, args.id)
         current_col = column_name(cfg, current["column_id"])
         if current_col == "Needs human":
+            released = _release_supervision_claim(claim_id)
+            route["supervision_released"] = bool(released)
             result = {"ok": False, "status": "blocked", "reason": "ticket moved to Needs human", "route": route}
             out(args, result, "supervise #%s blocked: ticket moved to Needs human" % args.id)
             return
@@ -2704,6 +3315,8 @@ def cmd_supervise(cfg, args):
                 strict=args.strict_closeout,
             )
             result = {"ok": final_report["ok"], "status": "closed", "route": route, "closeout": final_report}
+            released = _release_supervision_claim(claim_id)
+            route["supervision_released"] = bool(released)
             out(args, result, "supervise #%s closed: %s" % (args.id, "closeout pass" if final_report["ok"] else "closeout blocked"))
             return
         if poll >= args.max_polls:
@@ -2965,6 +3578,19 @@ def _add_watch_origin_args(sp):
                     help="caller-supplied async request/reply correlation id")
 
 
+def _add_supervision_claim_args(sp):
+    sp.add_argument("--supervisor-id",
+                    help="stable owner id for supervision claims; may also use AGENT_TICKETS_SUPERVISOR_ID")
+    sp.add_argument("--supervision-ttl-hours", type=float, default=DEFAULT_SUPERVISION_TTL_HOURS,
+                    help="hours before an un-heartbeated supervision claim becomes stale")
+    sp.add_argument("--adopt-supervision", action="store_true",
+                    help="allow same-owner reentry and stale claim adoption when acquiring supervision")
+    sp.add_argument("--steal-supervision", action="store_true",
+                    help="allow takeover of stale supervision claims; active other-owner claims still need --force-supervision")
+    sp.add_argument("--force-supervision", action="store_true",
+                    help="override active other-owner supervision claims instead of failing closed")
+
+
 def main():
     # --json works before OR after the subcommand. default=SUPPRESS so the
     # subparser copy doesn't clobber a value set by the top-level parser.
@@ -3045,6 +3671,26 @@ def main():
     sp.add_argument("--repo", help="filter by callback origin repo path or repo basename")
     sp.set_defaults(func=cmd_callbacks, needs_config=False)
 
+    sp = sub.add_parser("supervision", parents=[base],
+                        help="inspect or recover durable active supervision claims")
+    sp.add_argument("action", nargs="?", default="status", choices=["status", "release", "adopt", "steal"],
+                    help="status lists claims; release removes owned/stale claims; adopt/steal take stale claims")
+    sp.add_argument("--claim", help="claim id to inspect or recover")
+    sp.add_argument("--repo", help="repo path whose claims should be inspected or recovered")
+    sp.add_argument("--ticket", type=int, help="ticket id whose claims should be inspected or recovered")
+    sp.add_argument("--all", action="store_true", help="allow release/adopt/steal across all claims")
+    sp.add_argument("--active-only", action="store_true", help="status: hide stale claims")
+    sp.add_argument("--force", action="store_true", help="allow release/adopt/steal of active claims owned by another supervisor")
+    sp.add_argument("--supervisor-id",
+                    help="stable owner id for ownership checks; may also use AGENT_TICKETS_SUPERVISOR_ID")
+    sp.add_argument("--supervision-ttl-hours", type=float, default=DEFAULT_SUPERVISION_TTL_HOURS,
+                    help="hours before an adopted/stolen claim becomes stale without heartbeat")
+    sp.add_argument("--origin-repo", help="origin repo to store when adopting/stealing a claim")
+    sp.add_argument("--origin-provider", choices=DISPATCH_PROVIDERS,
+                    help="origin provider to store when adopting/stealing a claim")
+    sp.add_argument("--origin-session", help="origin tmux session to store when adopting/stealing a claim")
+    sp.set_defaults(func=cmd_supervision, needs_config=False)
+
     sp = sub.add_parser("tag", parents=[base], help="add/remove tags on a ticket")
     sp.add_argument("id", type=int)
     sp.add_argument("--add", action="append")
@@ -3090,6 +3736,7 @@ def main():
     sp.add_argument("--require-commit", action="store_true", help="closeout-check flag: require commit id")
     sp.add_argument("--require-install", action="store_true", help="closeout-check flag: require install/sync evidence")
     _add_watch_origin_args(sp)
+    _add_supervision_claim_args(sp)
     sp.set_defaults(func=cmd_supervise)
 
     sp = sub.add_parser("supervise-batch", parents=[base],
@@ -3123,6 +3770,7 @@ def main():
                     help="closeout-check flag: require validation evidence")
     sp.add_argument("--require-commit", action="store_true", help="closeout-check flag: require commit id")
     sp.add_argument("--require-install", action="store_true", help="closeout-check flag: require install/sync evidence")
+    _add_supervision_claim_args(sp)
     sp.set_defaults(func=cmd_supervise_batch)
 
     args = p.parse_args()

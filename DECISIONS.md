@@ -130,6 +130,15 @@ Ticket #39 added a first-class board-drain workflow for supervising multiple ope
 - `--dry-run` shows grouping, skipped tickets, refusals, repo paths, provider/session decisions, and launch/contact plans without comments, moves, sends, or launches. Real routing comments each queued ticket, moves `New` tickets to `Triaging`, polls all routed tickets without serializing repo groups, and aggregates per-ticket `closeout-check` reports. A routed ticket that remains open after the polling limit, moves to `Needs human`, or cannot be moved `New -> Triaging` after route blocks the aggregate batch result.
 - Batch supervision does not register watched-ticket callbacks by default. It is already the supervising process polling all tickets, so per-ticket callbacks would create notification spam rather than improve closeout.
 
+## Durable supervision claims (2026-05-12)
+
+Ticket #51 added a durable local claim layer so a second supervisor can see that a repo/ticket set is already being coordinated before it starts another owner worker:
+
+- Claims are JSON records under `~/.config/agent-tickets/supervision/`, guarded by a local `flock`, keyed by canonical repo path plus ticket ids. They store owner id, origin provider/repo/session when known, worker provider/session/mode, ticket ids, created/updated/last-heartbeat timestamps, expiry, and whether the current caller owns the claim in public output.
+- `agent-ticket supervise` and `agent-ticket supervise-batch` check active claims before normal route planning and acquire/update a claim after route selection but before any real `agent-contact` send, `agent-tmux` launch/resume, ticket comment, or ticket move. Same-owner reentry is allowed via `--supervisor-id` or `AGENT_TICKETS_SUPERVISOR_ID`; active other-owner claims for the same repo or overlapping tickets fail closed with `already supervised` unless `--force-supervision` is explicit.
+- Routed supervisors heartbeat the claim while polling. When all routed tickets close or move to `Needs human`, the claim is released. If the supervisor exits while tickets remain open or is interrupted, the claim remains visible until expiry and can be recovered explicitly.
+- `agent-ticket supervision status|release|adopt|steal` is the recovery surface. Status lists active and stale claims; release/adopt/steal require a claim/repo/ticket/all filter and only act on claims owned by the current supervisor or stale claims unless `--force` is supplied.
+
 ## Open / possible follow-ups (not done)
 
 - Set up the `bivex/kanboard-mcp` MCP server so MCP-capable agents get native tools (CLI works fine without it).

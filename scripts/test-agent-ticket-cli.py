@@ -51,6 +51,11 @@ class AgentTicketCliTests(unittest.TestCase):
         self.cli.WATCHERS_PATH = str(callback_dir / "watchers.json")
         self.cli.WATCHERS_LOCK_PATH = str(callback_dir / "watchers.lock")
         self.cli.OUTBOX_DIR = str(callback_dir / "outbox")
+        supervision_dir = pathlib.Path(self.tmpdir.name) / "supervision"
+        self.cli.SUPERVISION_DIR = str(supervision_dir)
+        self.cli.SUPERVISION_LEASES_PATH = str(supervision_dir / "leases.json")
+        self.cli.SUPERVISION_LOCK_PATH = str(supervision_dir / "leases.lock")
+        self.cli.BATCH_LOCK_DIR = str(pathlib.Path(self.tmpdir.name) / "batch-locks")
 
     def reserve_then_notify(self, cfg, ticket_id):
         self.cli._reserve_ticket_closed_callback(cfg, ticket_id)
@@ -77,10 +82,49 @@ class AgentTicketCliTests(unittest.TestCase):
             "require_validation": False,
             "require_commit": False,
             "require_install": False,
+            "supervisor_id": "test-supervisor",
+            "supervision_ttl_hours": 1,
+            "adopt_supervision": False,
+            "steal_supervision": False,
+            "force_supervision": False,
             "json": True,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def write_supervision_claims(self, claims):
+        path = pathlib.Path(self.cli.SUPERVISION_LEASES_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "claims": claims}, indent=2, sort_keys=True) + "\n")
+
+    def active_supervision_claim(self, claim_id="claim-demo", owner_id="other-supervisor",
+                                 repo="/tmp/demo", ticket_ids=None, now=None, ttl=3600):
+        now = time.time() if now is None else now
+        return {
+            "claim_id": claim_id,
+            "repo": repo,
+            "repo_key": "demo-key",
+            "project": "demo",
+            "projects": ["demo"],
+            "ticket_ids": list(ticket_ids or [80]),
+            "command": "supervise-batch",
+            "owner_id": owner_id,
+            "origin_provider": "codex",
+            "origin_repo": "/tmp/origin",
+            "origin_session": "origin-session",
+            "worker_provider": "codex",
+            "worker_session": "batch-owner-demo",
+            "worker_mode": "launch",
+            "created_at": self.cli._utc_iso(now - 20),
+            "created_at_epoch": now - 20,
+            "updated_at": self.cli._utc_iso(now - 5),
+            "updated_at_epoch": now - 5,
+            "last_heartbeat_at": self.cli._utc_iso(now - 5),
+            "last_heartbeat_epoch": now - 5,
+            "expires_at": self.cli._utc_iso(now + ttl),
+            "expires_at_epoch": now + ttl,
+            "heartbeat_count": 1,
+        }
 
     def test_rpc_retries_transient_database_lock(self):
         responses = [
@@ -264,6 +308,47 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("codex", result["route"]["provider"])
         self.assertEqual("resume-latest", result["route"]["mode"])
         self.assertEqual("owner-demo-47", result["route"]["session"])
+
+    def test_supervise_dry_run_blocks_overlapping_active_supervision_claim(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[47], repo="/tmp/demo"),
+        })
+        task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+        args = argparse.Namespace(
+            id=47, provider=None, session=None, session_prefix="owner", full_permission=True,
+            message="", dry_run=True, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("already supervised", result["reason"])
+        active = result["active_supervision"][0]
+        self.assertEqual("other-supervisor", active["owner_id"])
+        self.assertEqual([47], active["ticket_ids"])
+        self.assertFalse(active["owned_by_current"])
+        self.assertGreaterEqual(active["age_seconds"], 0)
+        self.assertGreater(active["expires_in_seconds"], 0)
+        contact.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_not_called()
 
     def test_supervise_launch_uses_new_ticket_scoped_session_not_existing_session(self):
         task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
@@ -1039,6 +1124,186 @@ class AgentTicketCliTests(unittest.TestCase):
         contact.assert_not_called()
         audit.assert_not_called()
         move.assert_not_called()
+
+    def test_supervise_batch_dry_run_blocks_active_supervision_claim_without_mutations(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo"),
+        })
+        group = {
+            "project": "demo",
+            "projects": ["demo"],
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 80, "title": "Demo", "severity": "p1", "kind": "bug", "column": "New",
+                         "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "_batch_collect_ticket_groups", return_value=([group], [])), \
+             mock.patch.object(self.cli, "_contactable_providers") as contactable, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch.object(self.cli, "move_task_to_column") as move, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise_batch({"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(dry_run=True))
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        group_result = result["groups"][0]
+        self.assertEqual("blocked", group_result["status"])
+        self.assertEqual("already supervised", group_result["route"]["reason"])
+        active = group_result["route"]["active_supervision"][0]
+        self.assertEqual("other-supervisor", active["owner_id"])
+        self.assertEqual("batch-owner-demo", active["worker_session"])
+        self.assertEqual([80], active["ticket_ids"])
+        self.assertFalse(active["owned_by_current"])
+        contactable.assert_not_called()
+        tmux.assert_not_called()
+        contact.assert_not_called()
+        audit.assert_not_called()
+        move.assert_not_called()
+
+    def test_supervise_batch_live_blocks_active_supervision_claim_before_mutations(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo"),
+        })
+        group = {
+            "project": "demo",
+            "projects": ["demo"],
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 80, "title": "Demo", "severity": "p1", "kind": "bug", "column": "New",
+                         "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "_batch_collect_ticket_groups", return_value=([group], [])), \
+             mock.patch.object(self.cli, "_contactable_providers") as contactable, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch.object(self.cli, "move_task_to_column") as move, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise_batch({"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(dry_run=False))
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("already supervised", result["groups"][0]["route"]["reason"])
+        contactable.assert_not_called()
+        tmux.assert_not_called()
+        contact.assert_not_called()
+        audit.assert_not_called()
+        move.assert_not_called()
+
+    def test_supervise_batch_same_owner_reentry_reports_owned_claim_and_plans_route(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[80], repo="/tmp/demo", owner_id="test-supervisor"),
+        })
+        group = {
+            "project": "demo",
+            "projects": ["demo"],
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 80, "title": "Demo", "severity": "p1", "kind": "bug", "column": "New",
+                         "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "_batch_collect_ticket_groups", return_value=([group], [])), \
+             mock.patch.object(self.cli, "_contactable_providers", return_value=([
+                 {"provider": "codex", "session": "safe-demo", "probe": {"ok": True}}
+             ], [])), \
+             mock.patch.object(self.cli, "get_task_in_project", return_value={"id": 80, "title": "Demo", "column_id": 1, "category_id": 1, "is_active": 1}), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "p1"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "category_name", return_value="bug"), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise_batch({"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(dry_run=True))
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        group_result = result["groups"][0]
+        self.assertEqual("planned", group_result["status"])
+        self.assertEqual("contact", group_result["route"]["mode"])
+        owned = group_result["supervision"]["owned_claims"][0]
+        self.assertEqual("claim-demo", owned["claim_id"])
+        self.assertTrue(owned["owned_by_current"])
+
+    def test_supervision_status_reports_active_claim_visibility(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo"),
+        })
+        out = io.StringIO()
+        args = argparse.Namespace(
+            action="status", claim=None, repo=None, ticket=None, all=True,
+            supervisor_id="current-supervisor", force=False, json=True,
+        )
+        with mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervision(None, args)
+
+        result = json.loads(out.getvalue())
+        self.assertEqual(1, len(result["claims"]))
+        claim = result["claims"][0]
+        self.assertEqual("claim-demo", claim["claim_id"])
+        self.assertTrue(claim["active"])
+        self.assertFalse(claim["owned_by_current"])
+        self.assertEqual("codex", claim["origin_provider"])
+        self.assertEqual("/tmp/origin", claim["origin_repo"])
+        self.assertEqual("origin-session", claim["origin_session"])
+        self.assertEqual("batch-owner-demo", claim["worker_session"])
+        self.assertGreaterEqual(claim["age_seconds"], 0)
+        self.assertGreater(claim["expires_in_seconds"], 0)
+
+    def test_supervision_release_requires_ownership_or_stale_claim(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo"),
+        })
+        out = io.StringIO()
+        args = argparse.Namespace(
+            action="release", claim="claim-demo", repo=None, ticket=None, all=False,
+            active_only=False, supervisor_id="current-supervisor", force=False,
+            supervision_ttl_hours=1, origin_repo=None, origin_provider=None, origin_session=None,
+            json=True,
+        )
+        with mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervision(None, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("claim-demo", result["blocked"][0]["claim_id"])
+        data = json.loads(pathlib.Path(self.cli.SUPERVISION_LEASES_PATH).read_text())
+        self.assertIn("claim-demo", data["claims"])
+
+    def test_supervision_release_allows_stale_claim_recovery(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo", ttl=-10),
+        })
+        out = io.StringIO()
+        args = argparse.Namespace(
+            action="release", claim="claim-demo", repo=None, ticket=None, all=False,
+            active_only=False, supervisor_id="current-supervisor", force=False,
+            supervision_ttl_hours=1, origin_repo=None, origin_provider=None, origin_session=None,
+            json=True,
+        )
+        with mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervision(None, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("claim-demo", result["claims"][0]["claim_id"])
+        data = json.loads(pathlib.Path(self.cli.SUPERVISION_LEASES_PATH).read_text())
+        self.assertEqual({}, data["claims"])
+
+    def test_supervise_batch_adopt_supervision_reuses_stale_claim(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(ticket_ids=[80], repo="/tmp/demo", ttl=-10),
+        })
+        route = {"provider": "codex", "session": "safe-demo", "mode": "contact"}
+        claim, conflicts = self.cli._acquire_supervision_claim(
+            self.batch_args(adopt_supervision=True, supervisor_id="current-supervisor"),
+            "supervise-batch", "/tmp/demo", "demo", ["demo"], [80], route=route)
+
+        self.assertEqual([], conflicts)
+        self.assertEqual("claim-demo", claim["claim_id"])
+        self.assertEqual("current-supervisor", claim["owner_id"])
+        self.assertEqual("safe-demo", claim["worker_session"])
 
     def test_supervise_batch_blocks_instead_of_launching_duplicate_when_existing_session_is_unsafe(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
