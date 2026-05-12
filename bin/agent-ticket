@@ -1,0 +1,3135 @@
+#!/usr/bin/env python3
+"""agent-ticket — minimal CLI for AI agents to file/query/manage tickets in a
+local Kanboard ("Agent Tickets" board) via its JSON-RPC API.
+
+SCOPE: this board is for problems agents hit while *using/operating* the user's
+apps & tools (a tool crashed, behaved wrong, a flag is broken, docs were wrong,
+the harness misbehaved). It is NOT a development backlog and NOT your in-flight
+TODO list — see the installed agent-tickets skill under ~/.codex/skills or
+~/.claude/skills.
+
+Config: ~/.config/agent-tickets/config.json
+  { "endpoint": "...", "token": "...", "project_id": N, "comment_user_id": 1,
+    "repo_roots": ["~/Dropbox/work/MyTools"] }
+Env overrides: AGENT_TICKETS_ENDPOINT, AGENT_TICKETS_TOKEN,
+               AGENT_TICKETS_PROJECT_ID, AGENT_TICKETS_COMMENT_USER_ID
+
+Output is human-readable by default; pass --json (before OR after the
+subcommand) for raw JSON.
+"""
+import argparse, base64, calendar, fcntl, hashlib, json, os, re, subprocess, sys, threading, time, urllib.request, urllib.error
+
+CONFIG_PATH = os.path.expanduser("~/.config/agent-tickets/config.json")
+CONFIG_DIR = os.path.dirname(CONFIG_PATH)
+SOURCE_MANIFEST_PATH = os.path.join(CONFIG_DIR, "source.json")
+CALLBACK_DIR = os.path.join(CONFIG_DIR, "callbacks")
+WATCHERS_PATH = os.path.join(CALLBACK_DIR, "watchers.json")
+WATCHERS_LOCK_PATH = os.path.join(CALLBACK_DIR, "watchers.lock")
+OUTBOX_DIR = os.path.join(CALLBACK_DIR, "outbox")
+BATCH_LOCK_DIR = os.path.join(CONFIG_DIR, "batch-locks")
+DEFAULT_ENDPOINT = "http://127.0.0.1:8765/jsonrpc.php"
+DEFAULT_REPO_ROOTS = ["~/Dropbox/work/MyTools"]   # searched for a <project> subdir by `dispatch`
+DUP_MIN_LEN = 12                                  # min substring/title length to count as a "strong" duplicate
+RPC_TIMEOUT_SECONDS = 15
+RPC_LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
+DEFAULT_SUPERVISE_POLL_INTERVAL = 15
+DEFAULT_SUPERVISE_MAX_POLLS = 120
+DEFAULT_WATCH_EXPIRES_HOURS = 72
+CALLBACK_DELIVERING_STALE_SECONDS = 300
+DEFAULT_BATCH_SESSION_PREFIX = "batch-owner"
+
+KIND_CHOICES = ["bug", "friction", "request", "blocker", "question", "idea", "regression"]
+SEVERITY_CHOICES = ["p1", "p2", "p3"]
+COLUMN_CHOICES = ["New", "Triaging", "Agent working", "Needs human", "Done"]
+DISPATCH_PROVIDERS = ["codex", "claude"]
+_DISPATCH_COMMENT_PREFIX = "dispatched to "       # how a successful-dispatch audit comment starts (double-dispatch guard)
+_DISPATCH_P3_SKIP_PREFIX = "dispatch skipped: p3"
+_REOPEN_COMMENT_PREFIX = "agent-ticket reopen:"
+_CALLBACK_COMMENT_PREFIX = "agent-ticket callback:"
+
+_VALIDATION_RE = re.compile(
+    r"\b(validation|validated|verification|verified|test|tests|pytest|py_compile|ctest|smoke|build|lint)\b",
+    re.IGNORECASE,
+)
+_COMMIT_RE = re.compile(r"\b(?:commit|head|revision)\s*[:=]?\s*([0-9a-f]{7,40})\b", re.IGNORECASE)
+_INSTALL_RE = re.compile(r"\b(install|installed|rollout|roll out|rolled out|sync|synchronized|source-info)\b", re.IGNORECASE)
+
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            sys.exit("agent-ticket: %s is not valid JSON (%s) — fix it and re-run." % (CONFIG_PATH, e))
+    cfg["endpoint"] = os.environ.get("AGENT_TICKETS_ENDPOINT") or cfg.get("endpoint", DEFAULT_ENDPOINT)
+    cfg["token"] = os.environ.get("AGENT_TICKETS_TOKEN") or cfg.get("token")
+    pid = os.environ.get("AGENT_TICKETS_PROJECT_ID") or cfg.get("project_id")
+    if pid is None:
+        sys.exit("agent-ticket: no project_id configured in %s — run `bootstrap-board.py` (or `./install.sh`) "
+                 "first, or set AGENT_TICKETS_PROJECT_ID." % CONFIG_PATH)
+    cfg["project_id"] = int(pid)
+    cfg["comment_user_id"] = int(os.environ.get("AGENT_TICKETS_COMMENT_USER_ID", cfg.get("comment_user_id", 1)))
+    cfg["repo_roots"] = cfg.get("repo_roots") or DEFAULT_REPO_ROOTS
+    if not cfg.get("token") or cfg["token"] == "PUT-YOUR-KANBOARD-API-TOKEN-HERE":
+        sys.exit("agent-ticket: no API token — put the Kanboard application API token (Settings -> API -> "
+                 "'API token', the 'jsonrpc' user's token) in %s, or set AGENT_TICKETS_TOKEN." % CONFIG_PATH)
+    return cfg
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, "missing"
+    except json.JSONDecodeError as e:
+        return None, "invalid JSON: %s" % e
+    except OSError as e:
+        return None, str(e)
+
+
+def _sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _git_metadata_state(source_dir):
+    git_path = os.path.join(source_dir, ".git")
+    if not os.path.lexists(git_path):
+        return {"path": git_path, "state": "absent"}
+    if os.path.islink(git_path):
+        return {"path": git_path, "state": "symlink", "target": os.path.realpath(git_path)}
+    if os.path.isfile(git_path):
+        return {"path": git_path, "state": "file"}
+    if os.path.isdir(git_path):
+        try:
+            entries = os.listdir(git_path)
+        except OSError as e:
+            return {"path": git_path, "state": "unreadable-directory", "error": str(e)}
+        return {"path": git_path, "state": "directory" if entries else "empty-directory"}
+    return {"path": git_path, "state": "other"}
+
+
+def _run_git(source_dir, *args):
+    try:
+        return subprocess.run(
+            ["git", "-C", source_dir, *args],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except (OSError, ValueError) as e:
+        return e
+
+
+def _first_line(text):
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _git_info(source_dir):
+    info = {
+        "available": False,
+        "metadata": _git_metadata_state(source_dir),
+    }
+    p = _run_git(source_dir, "rev-parse", "--show-toplevel")
+    if p is None:
+        info["error"] = "git executable not found"
+        return info
+    if p == "timeout":
+        info["error"] = "git rev-parse timed out"
+        return info
+    if isinstance(p, Exception):
+        info["error"] = str(p)
+        return info
+    if p.returncode != 0:
+        info["error"] = _first_line(p.stderr) or _first_line(p.stdout) or "git rev-parse failed"
+        return info
+
+    info["available"] = True
+    info["toplevel"] = p.stdout.strip()
+
+    head = _run_git(source_dir, "rev-parse", "--short", "HEAD")
+    if hasattr(head, "returncode") and head.returncode == 0:
+        info["head"] = head.stdout.strip()
+
+    branch = _run_git(source_dir, "branch", "--show-current")
+    if hasattr(branch, "returncode") and branch.returncode == 0 and branch.stdout.strip():
+        info["branch"] = branch.stdout.strip()
+
+    status = _run_git(source_dir, "status", "--short", "--branch")
+    if hasattr(status, "returncode") and status.returncode == 0:
+        info["status_short_branch"] = status.stdout.splitlines()
+    elif hasattr(status, "returncode"):
+        info["status_error"] = _first_line(status.stderr) or _first_line(status.stdout)
+    return info
+
+
+def _looks_like_source_tree(path):
+    return (
+        bool(path)
+        and os.path.isfile(os.path.join(path, "install.sh"))
+        and os.path.isfile(os.path.join(path, "bin", "agent-ticket"))
+        and os.path.isfile(os.path.join(path, "skill", "SKILL.md"))
+    )
+
+
+def _infer_running_source_tree():
+    here = os.path.realpath(__file__)
+    candidate = os.path.dirname(os.path.dirname(here))
+    return candidate if _looks_like_source_tree(candidate) else None
+
+
+def _source_info():
+    manifest, manifest_error = _read_json(SOURCE_MANIFEST_PATH)
+    manifest = manifest or {}
+    inferred_source = _infer_running_source_tree()
+
+    source_dir = manifest.get("source_dir") or inferred_source
+    if source_dir:
+        source_dir = os.path.realpath(os.path.expanduser(source_dir))
+
+    installed_cli = manifest.get("installed_cli") or os.path.realpath(__file__)
+    installed_cli = os.path.realpath(os.path.expanduser(installed_cli))
+
+    source_cli = manifest.get("source_cli")
+    if not source_cli and source_dir:
+        source_cli = os.path.join(source_dir, "bin", "agent-ticket")
+    if source_cli:
+        source_cli = os.path.realpath(os.path.expanduser(source_cli))
+
+    source_skill = manifest.get("source_skill")
+    if not source_skill and source_dir:
+        source_skill = os.path.join(source_dir, "skill", "SKILL.md")
+    if source_skill:
+        source_skill = os.path.realpath(os.path.expanduser(source_skill))
+
+    source_notify_hook = manifest.get("source_notify_hook")
+    if not source_notify_hook and source_dir:
+        source_notify_hook = os.path.join(source_dir, "scripts", "notify-hook.sh")
+    if source_notify_hook:
+        source_notify_hook = os.path.realpath(os.path.expanduser(source_notify_hook))
+
+    installed_hash = _sha256(installed_cli)
+    source_hash = _sha256(source_cli) if source_cli else None
+    matches = None
+    if installed_hash and source_hash:
+        matches = installed_hash == source_hash
+
+    installed_codex_skill = os.path.realpath(os.path.expanduser(
+        manifest.get("installed_codex_skill") or "~/.codex/skills/agent-tickets/SKILL.md"))
+    installed_claude_skill = os.path.realpath(os.path.expanduser(
+        manifest.get("installed_claude_skill") or "~/.claude/skills/agent-tickets/SKILL.md"))
+    installed_notify_hook = os.path.realpath(os.path.expanduser(
+        manifest.get("installed_notify_hook") or os.path.join(CONFIG_DIR, "notify-hook.sh")))
+    source_skill_hash = _sha256(source_skill) if source_skill else None
+    installed_codex_skill_hash = _sha256(installed_codex_skill)
+    installed_claude_skill_hash = _sha256(installed_claude_skill)
+    source_notify_hook_hash = _sha256(source_notify_hook) if source_notify_hook else None
+    installed_notify_hook_hash = _sha256(installed_notify_hook)
+
+    source_exists = bool(source_dir and os.path.isdir(source_dir))
+    installed_link_path = os.path.expanduser(manifest.get("installed_cli") or __file__)
+    installed_is_symlink = os.path.islink(installed_link_path)
+
+    info = {
+        "installed_cli": installed_cli,
+        "invoked_script": os.path.realpath(__file__),
+        "install_mode": manifest.get("install_mode") or ("source-tree" if inferred_source else "unknown"),
+        "runtime_uses_source_tree": bool(installed_is_symlink),
+        "source_manifest": SOURCE_MANIFEST_PATH,
+        "source_manifest_loaded": manifest_error is None,
+        "source_manifest_error": manifest_error,
+        "source_dir": source_dir,
+        "source_dir_exists": source_exists,
+        "source_cli": source_cli,
+        "source_cli_exists": bool(source_cli and os.path.isfile(source_cli)),
+        "source_skill": source_skill,
+        "source_skill_exists": bool(source_skill and os.path.isfile(source_skill)),
+        "source_notify_hook": source_notify_hook,
+        "source_notify_hook_exists": bool(source_notify_hook and os.path.isfile(source_notify_hook)),
+        "installed_cli_sha256": installed_hash,
+        "source_cli_sha256": source_hash,
+        "installed_cli_matches_source": matches,
+        "installed_codex_skill": installed_codex_skill,
+        "installed_claude_skill": installed_claude_skill,
+        "installed_codex_skill_sha256": installed_codex_skill_hash,
+        "installed_claude_skill_sha256": installed_claude_skill_hash,
+        "source_skill_sha256": source_skill_hash,
+        "installed_codex_skill_matches_source": (
+            installed_codex_skill_hash == source_skill_hash if installed_codex_skill_hash and source_skill_hash else None
+        ),
+        "installed_claude_skill_matches_source": (
+            installed_claude_skill_hash == source_skill_hash if installed_claude_skill_hash and source_skill_hash else None
+        ),
+        "installed_notify_hook": installed_notify_hook,
+        "installed_notify_hook_sha256": installed_notify_hook_hash,
+        "source_notify_hook_sha256": source_notify_hook_hash,
+        "installed_notify_hook_matches_source": (
+            installed_notify_hook_hash == source_notify_hook_hash if installed_notify_hook_hash and source_notify_hook_hash else None
+        ),
+        "rollout_command": manifest.get("rollout_command") or (("cd %s && ./install.sh" % source_dir) if source_dir else None),
+        "normal_runtime_note": "ticket operations use the installed copy; source-info is the diagnostic path back to source",
+    }
+    if source_exists:
+        info["git"] = _git_info(source_dir)
+    else:
+        info["git"] = {"available": False, "error": "source_dir is missing", "metadata": None}
+    if manifest.get("source_git"):
+        info["install_time_git"] = manifest["source_git"]
+    return info
+
+
+def web_base(cfg):
+    """Derive the Kanboard web base URL from the configured JSON-RPC endpoint,
+    so we never depend on Kanboard's 'Application URL' setting (which a fresh
+    install does not configure)."""
+    ep = cfg["endpoint"].rstrip("/")
+    for suffix in ("/jsonrpc.php", "/jsonrpc"):
+        if ep.endswith(suffix):
+            return ep[: -len(suffix)]
+    # endpoint without a recognised suffix: drop the last path segment if any
+    scheme, _, rest = ep.partition("://")
+    if "/" in rest:
+        return scheme + "://" + rest.rsplit("/", 1)[0]
+    return ep
+
+
+def web_url(cfg, path):
+    return "%s/%s" % (web_base(cfg).rstrip("/"), path.lstrip("/"))
+
+
+def _api_error_text(error):
+    if isinstance(error, dict):
+        return " ".join(str(error.get(k, "")) for k in ("code", "message", "data"))
+    return str(error)
+
+
+def _is_transient_db_lock(error):
+    msg = _api_error_text(error).lower()
+    return (
+        "database is locked" in msg
+        or "database table is locked" in msg
+        or ("sqlstate[hy000]" in msg and "general error: 5" in msg)
+    )
+
+
+def rpc(cfg, method, params=None):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        payload["params"] = params
+    data = json.dumps(payload).encode()
+    auth = base64.b64encode(("jsonrpc:" + cfg["token"]).encode()).decode()
+    headers = {"Content-Type": "application/json", "Authorization": "Basic " + auth}
+    for attempt in range(len(RPC_LOCK_RETRY_DELAYS) + 1):
+        req = urllib.request.Request(cfg["endpoint"], data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT_SECONDS) as r:
+                body = json.loads(r.read().decode())
+        except urllib.error.URLError as e:
+            sys.exit("agent-ticket: cannot reach Kanboard at %s (%s). Is the container running? "
+                     "`docker start kanboard`" % (cfg["endpoint"], e))
+        if "error" not in body:
+            return body.get("result")
+        error = body["error"]
+        if not _is_transient_db_lock(error) or attempt >= len(RPC_LOCK_RETRY_DELAYS):
+            sys.exit("agent-ticket: API error: %s" % json.dumps(error))
+        delay = RPC_LOCK_RETRY_DELAYS[attempt]
+        sys.stderr.write(
+            "agent-ticket: Kanboard database is locked during %s; retrying in %.2fs (%d/%d)\n"
+            % (method, delay, attempt + 1, len(RPC_LOCK_RETRY_DELAYS))
+        )
+        time.sleep(delay)
+
+
+# ---- helpers -------------------------------------------------------------
+
+def expand_escapes(s):
+    """Let agents pass \\n / \\t in --body and have them mean newline/tab."""
+    return (s or "").replace("\\n", "\n").replace("\\t", "\t")
+
+
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _san(s):
+    """Strip C0/C1 control chars (but keep \\n and \\t) so ticket text — which is
+    written by other agents/users — can't inject ANSI/OSC escapes into the terminal
+    when shown in human output. Raw text is still available via --json."""
+    return _CTRL_RE.sub("", s) if isinstance(s, str) else ("" if s is None else str(s))
+
+
+def task_tags(cfg, task_id):
+    """Kanboard's getTask result does NOT include tags; fetch them separately.
+    getTaskTags returns {} (no tags) or {"1": "bug", "2": "p3", ...}."""
+    res = rpc(cfg, "getTaskTags", {"task_id": int(task_id)})
+    if isinstance(res, dict):
+        return sorted(res.values())
+    if isinstance(res, list):
+        return sorted(res)
+    if res in (None, False):   # an actual API failure — don't pretend the ticket has no tags
+        sys.exit("agent-ticket: getTaskTags(#%s) failed (returned %r)." % (task_id, res))
+    return []
+
+
+def get_task_in_project(cfg, task_id):
+    """Fetch a task and refuse if it isn't in the configured project — a mistyped
+    id could otherwise act on a task from some other Kanboard project."""
+    t = rpc(cfg, "getTask", {"task_id": int(task_id)})
+    if not t:
+        sys.exit("agent-ticket: no ticket #%s" % task_id)
+    if int(t.get("project_id") or 0) != int(cfg["project_id"]):
+        sys.exit("agent-ticket: ticket #%s belongs to project %s, not the configured project %s — refusing."
+                 % (task_id, t.get("project_id"), cfg["project_id"]))
+    return t
+
+
+def resolve_column_id(cfg, name):
+    cols = rpc(cfg, "getColumns", {"project_id": cfg["project_id"]})
+    for c in cols:
+        if c["title"].lower() == name.lower():
+            return int(c["id"])
+    sys.exit("agent-ticket: no column named %r (have: %s)" % (name, ", ".join(c["title"] for c in cols)))
+
+
+def resolve_category_id(cfg, kind, create=True):
+    """Return the category id for `kind`. With create=True (writes), make it if
+    missing; with create=False (reads/filters), return None if it doesn't exist
+    — never mutate the board from a query."""
+    if not kind:
+        return 0
+    cats = rpc(cfg, "getAllCategories", {"project_id": cfg["project_id"]})
+    for c in cats:
+        if c["name"].lower() == kind.lower():
+            return int(c["id"])
+    if not create:
+        return None
+    return int(_ok(rpc(cfg, "createCategory", {"project_id": cfg["project_id"], "name": kind}), "create category %r" % kind))
+
+
+def category_name(cfg, cid):
+    if not cid:
+        return ""
+    for c in rpc(cfg, "getAllCategories", {"project_id": cfg["project_id"]}):
+        if int(c["id"]) == int(cid):
+            return c["name"]
+    return ""
+
+
+def column_name(cfg, col_id):
+    for c in rpc(cfg, "getColumns", {"project_id": cfg["project_id"]}):
+        if int(c["id"]) == int(col_id):
+            return c["title"]
+    return str(col_id)
+
+
+def out(args, obj, human):
+    if getattr(args, "json", False):
+        print(json.dumps(obj, indent=2))
+    else:
+        print(human)
+
+
+def _ok(res, what):
+    """Kanboard returns `false` (not an HTTP error) when a mutation fails — don't
+    report success in that case."""
+    if res is False or res is None:
+        sys.exit("agent-ticket: %s failed (Kanboard returned %r)." % (what, res))
+    return res
+
+
+def _task_is_active(task):
+    value = task.get("is_active")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ("", "0", "false", "none")
+
+
+def move_task_to_column(cfg, task, column, what=None):
+    col_id = resolve_column_id(cfg, column)
+    if int(task.get("column_id") or 0) == col_id:
+        return col_id
+    _ok(rpc(cfg, "moveTaskPosition", {
+        "project_id": cfg["project_id"], "task_id": int(task["id"]),
+        "column_id": col_id, "position": 1, "swimlane_id": int(task.get("swimlane_id") or 1)}),
+        what or "move #%s -> %s" % (task["id"], column))
+    return col_id
+
+
+def audit_comment(cfg, task_id, text):
+    """Record a dispatch-outcome comment on a ticket. Best-effort: a comment
+    failure (or a Kanboard hiccup) warns to stderr but never aborts — the
+    dispatch result still needs to be reported on stdout."""
+    try:
+        res = rpc(cfg, "createComment", {"task_id": int(task_id), "user_id": cfg["comment_user_id"],
+                                         "content": _san(text)})
+        if res is False or res is None:
+            sys.stderr.write("agent-ticket: warning: couldn't record audit comment on #%s\n" % task_id)
+    except SystemExit:   # rpc() sys.exits on transport/API error; don't let that kill the dispatch report
+        sys.stderr.write("agent-ticket: warning: couldn't record audit comment on #%s (Kanboard error)\n" % task_id)
+
+
+# ---- watched-ticket callbacks -------------------------------------------
+
+def _utc_iso(epoch=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if epoch is None else epoch))
+
+
+def _parse_utc_iso(value):
+    if not value:
+        return None
+    try:
+        return calendar.timegm(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _ensure_callback_dirs():
+    os.makedirs(CALLBACK_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(OUTBOX_DIR, mode=0o700, exist_ok=True)
+    for path in (CALLBACK_DIR, OUTBOX_DIR):
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+def _lock_watcher_store():
+    _ensure_callback_dirs()
+    try:
+        fd = os.open(WATCHERS_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(WATCHERS_LOCK_PATH, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError as e:
+        sys.exit("agent-ticket: couldn't lock callback watcher store %s (%s)" % (WATCHERS_LOCK_PATH, e))
+
+
+def _unlock_watcher_store(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _write_json_atomic(path, obj):
+    _ensure_callback_dirs()
+    tmp = "%s.tmp.%s" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        sys.exit("agent-ticket: couldn't write callback state %s (%s)" % (path, e))
+
+
+def _load_watcher_store(strict=False):
+    data, err = _read_json(WATCHERS_PATH)
+    if data is None:
+        if strict and err != "missing":
+            sys.exit("agent-ticket: callback watcher store %s is unreadable (%s)" % (WATCHERS_PATH, err))
+        return {"version": 1, "watchers": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("watchers"), dict):
+        if strict:
+            sys.exit("agent-ticket: callback watcher store %s has an invalid schema" % WATCHERS_PATH)
+        return {"version": 1, "watchers": {}}
+    data.setdefault("version", 1)
+    return data
+
+
+def _save_watcher_store(store):
+    store.setdefault("version", 1)
+    store.setdefault("watchers", {})
+    _write_json_atomic(WATCHERS_PATH, store)
+
+
+def _safe_file_component(value):
+    return re.sub(r"[^A-Za-z0-9_.=-]+", "_", str(value)).strip("._") or "event"
+
+
+def _ensure_batch_lock_dir():
+    os.makedirs(BATCH_LOCK_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(BATCH_LOCK_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _batch_repo_lock_path(repo):
+    canonical = os.path.realpath(os.path.expanduser(str(repo)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    basename = _safe_file_component(os.path.basename(canonical) or "repo")
+    return os.path.join(BATCH_LOCK_DIR, "%s-%s.lock" % (basename, digest))
+
+
+def _lock_batch_repo(repo):
+    _ensure_batch_lock_dir()
+    path = _batch_repo_lock_path(repo)
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"repo": os.path.realpath(os.path.expanduser(str(repo))), "pid": os.getpid(), "locked_at": _utc_iso()}).encode("utf-8"))
+        return fd
+    except OSError as e:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        sys.exit("agent-ticket: couldn't lock batch repo %s (%s)" % (repo, e))
+
+
+def _unlock_batch_repo(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _event_path(event_key):
+    return os.path.join(OUTBOX_DIR, _safe_file_component(event_key) + ".json")
+
+
+def _event_lock_path(event_key):
+    return os.path.join(OUTBOX_DIR, _safe_file_component(event_key) + ".lock")
+
+
+def _lock_event(event_key):
+    _ensure_callback_dirs()
+    try:
+        fd = os.open(_event_lock_path(event_key), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(_event_lock_path(event_key), 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError as e:
+        sys.exit("agent-ticket: couldn't lock callback event %s (%s)" % (event_key, e))
+
+
+def _unlock_event(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _read_event_record(event_key):
+    data, _ = _read_json(_event_path(event_key))
+    return _normalize_callback_record(data) if isinstance(data, dict) else None
+
+
+def _read_event_record_strict(event_key):
+    path = _event_path(event_key)
+    data, err = _read_json(path)
+    if data is None:
+        sys.exit("agent-ticket: callback event %s is missing or unreadable at %s (%s)"
+                 % (event_key, path, err))
+    if not isinstance(data, dict) or data.get("event_key") != event_key:
+        sys.exit("agent-ticket: callback event %s at %s has an invalid schema" % (event_key, path))
+    return _normalize_callback_record(data)
+
+
+def _write_event_record(record):
+    _write_json_atomic(_event_path(record["event_key"]), record)
+
+
+def _is_stale_delivering(record, now=None):
+    if not record or record.get("status") != "delivering":
+        return False
+    started = _parse_utc_iso(record.get("delivery_started_at"))
+    if started is None:
+        return True
+    now = time.time() if now is None else now
+    return now - started >= CALLBACK_DELIVERING_STALE_SECONDS
+
+
+def _normalize_callback_record(record, now=None):
+    if _is_stale_delivering(record, now=now):
+        record["status"] = "pending"
+        record["pending_reason"] = "stale delivering state from interrupted delivery"
+        record["stale_delivery_recovered_at"] = _utc_iso(now)
+        record.pop("delivery_started_at", None)
+    return record
+
+
+def _supersede_callback_event(event_key, reason):
+    if not event_key:
+        return None
+    fd = _lock_event(event_key)
+    try:
+        record = _read_event_record(event_key)
+        if not record:
+            return None
+        if record.get("status") in ("acknowledged", "superseded"):
+            return record
+        previous = record.get("status")
+        record["status"] = "superseded"
+        record["superseded_at"] = _utc_iso()
+        record["superseded_reason"] = reason
+        record["superseded_from_status"] = previous
+        record.pop("pending_reason", None)
+        record.pop("delivery_started_at", None)
+        _write_event_record(record)
+        return record
+    finally:
+        _unlock_event(fd)
+
+
+def _preflight_callback_outbox_write():
+    _ensure_callback_dirs()
+    path = os.path.join(OUTBOX_DIR, ".preflight-%s.tmp" % os.getpid())
+    try:
+        with open(path, "w") as f:
+            f.write("{}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.unlink(path)
+    except OSError as e:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+        sys.exit("agent-ticket: callback outbox is not writable (%s)" % e)
+
+
+def _preflight_ticket_closed_callback(task_id):
+    fd = _lock_watcher_store()
+    try:
+        store = _load_watcher_store(strict=True)
+        watcher = store.get("watchers", {}).get(str(int(task_id)))
+        if watcher and not watcher.get("last_closed_state"):
+            _preflight_callback_outbox_write()
+            return True
+        return False
+    finally:
+        _unlock_watcher_store(fd)
+
+
+def _reserve_ticket_closed_callback(cfg, task_id):
+    fd = _lock_watcher_store()
+    try:
+        store = _load_watcher_store(strict=True)
+        watcher = store.get("watchers", {}).get(str(int(task_id)))
+        if not watcher:
+            return None
+        if watcher.get("last_closed_state"):
+            if not watcher.get("last_event_key"):
+                return None
+            return _read_event_record_strict(watcher["last_event_key"])
+
+        revision = int(watcher.get("close_revision") or 0) + 1
+        event_key = "ticket:%d:closed:%d" % (int(task_id), revision)
+        existing = _read_event_record(event_key)
+        if existing:
+            record = existing
+        else:
+            closeout = _closeout_for_callback(cfg, task_id)
+            record = {
+                "schema": 1,
+                "event": "ticket.closed",
+                "event_key": event_key,
+                "ticket_id": int(task_id),
+                "revision": revision,
+                "created_at": _utc_iso(),
+                "reserved_at": _utc_iso(),
+                "status": "closing",
+                "ticket_url": web_url(cfg, "task/%d" % int(task_id)),
+                "watcher": watcher,
+                "closeout": closeout,
+                "delivery_attempts": [],
+            }
+            _write_event_record(record)
+
+        watcher["close_revision"] = revision
+        watcher["last_closed_state"] = True
+        watcher["last_event_key"] = event_key
+        watcher["last_closed_at"] = _utc_iso()
+        store["watchers"][str(int(task_id))] = watcher
+        _save_watcher_store(store)
+        return record
+    finally:
+        _unlock_watcher_store(fd)
+
+
+def _current_origin_repo():
+    try:
+        p = subprocess.run(["git", "-C", os.getcwd(), "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, errors="replace", timeout=5)
+        if p.returncode == 0 and p.stdout.strip():
+            return os.path.realpath(p.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return os.path.realpath(os.getcwd())
+
+
+def _origin_watcher_record(task_id, args, source_command, prior=None, now=None):
+    now = time.time() if now is None else now
+    hours = float(getattr(args, "watch_expires_hours", DEFAULT_WATCH_EXPIRES_HOURS) or DEFAULT_WATCH_EXPIRES_HOURS)
+    if hours <= 0:
+        sys.exit("agent-ticket: --watch-expires-hours must be greater than zero")
+    origin_repo = getattr(args, "origin_repo", None) or os.environ.get("AGENT_TICKETS_ORIGIN_REPO") or _current_origin_repo()
+    origin_repo = os.path.realpath(os.path.expanduser(origin_repo))
+    provider = getattr(args, "origin_provider", None) or os.environ.get("AGENT_TICKETS_ORIGIN_PROVIDER") or None
+    if provider and provider not in DISPATCH_PROVIDERS:
+        sys.exit("agent-ticket: origin provider %r is not supported (expected one of: %s)"
+                 % (provider, ", ".join(DISPATCH_PROVIDERS)))
+    session = getattr(args, "origin_session", None) or os.environ.get("AGENT_TICKETS_ORIGIN_SESSION") or None
+    correlation_id = (
+        getattr(args, "correlation_id", None)
+        or os.environ.get("AGENT_TICKETS_CORRELATION_ID")
+        or "ticket:%d:watch:%d:%d" % (int(task_id), int(now), os.getpid())
+    )
+    expires_at = now + (hours * 3600.0)
+    prior = prior or {}
+    return {
+        "ticket_id": int(task_id),
+        "origin_repo": origin_repo,
+        "origin_provider": provider,
+        "origin_session": session,
+        "created_at": _utc_iso(now),
+        "expires_at": _utc_iso(expires_at),
+        "expires_at_epoch": expires_at,
+        "callback_reason": getattr(args, "callback_reason", None) or "watched ticket closed",
+        "correlation_id": correlation_id,
+        "source_command": source_command,
+        "close_revision": int(prior.get("close_revision") or 0),
+        "last_closed_state": bool(prior.get("last_closed_state", False)),
+        "last_event_key": prior.get("last_event_key"),
+        "delivered_events": list(prior.get("delivered_events") or []),
+    }
+
+
+def _register_origin_watcher(cfg, task_id, args, source_command):
+    if not getattr(args, "watch_origin", False):
+        return None
+    fd = _lock_watcher_store()
+    try:
+        store = _load_watcher_store(strict=True)
+        key = str(int(task_id))
+        watcher = _origin_watcher_record(task_id, args, source_command, prior=store["watchers"].get(key))
+        store["watchers"][key] = watcher
+        _save_watcher_store(store)
+    finally:
+        _unlock_watcher_store(fd)
+    audit_comment(
+        cfg,
+        task_id,
+        ("%s registered origin watcher for ticket.closed; correlation=%s; origin_repo=%s; "
+         "provider=%s; session=%s; expires_at=%s")
+        % (
+            _CALLBACK_COMMENT_PREFIX,
+            watcher["correlation_id"],
+            watcher["origin_repo"],
+            watcher.get("origin_provider") or "(unknown)",
+            watcher.get("origin_session") or "(auto-discover)",
+            watcher["expires_at"],
+        ),
+    )
+    return watcher
+
+
+def _mark_ticket_reopened_for_callbacks(task_id):
+    fd = _lock_watcher_store()
+    try:
+        store = _load_watcher_store(strict=True)
+        watcher = store.get("watchers", {}).get(str(int(task_id)))
+        if not watcher:
+            return None
+        superseded = _supersede_callback_event(
+            watcher.get("last_event_key"),
+            "ticket reopened before callback was acknowledged",
+        )
+        watcher["last_closed_state"] = False
+        watcher["reopened_at"] = _utc_iso()
+        _save_watcher_store(store)
+        return {"watcher": watcher, "superseded_event": superseded}
+    finally:
+        _unlock_watcher_store(fd)
+
+
+def _callback_closeout_summary(closeout):
+    if not closeout:
+        return "closeout evidence unavailable"
+    parts = ["closeout-check %s" % ("pass" if closeout.get("ok") else "blocked")]
+    for check in closeout.get("checks", []):
+        if check.get("name") in ("validation_evidence", "install_sync_evidence", "worktree_clean", "commit_id"):
+            parts.append("%s=%s" % (check.get("name"), check.get("status")))
+    return "; ".join(parts)
+
+
+def _closeout_for_callback(cfg, task_id):
+    try:
+        report = _closeout_report(cfg, task_id, strict=False)
+        return {
+            "ok": bool(report.get("ok")),
+            "project": report.get("project"),
+            "repo": report.get("repo"),
+            "summary": _callback_closeout_summary(report),
+            "checks": report.get("checks", []),
+        }
+    except SystemExit as e:
+        return {"ok": False, "summary": "closeout-check unavailable: %s" % e, "checks": []}
+
+
+def _callback_message(record):
+    watcher = record.get("watcher") or {}
+    closeout = record.get("closeout") or {}
+    project = closeout.get("project") or "(unknown)"
+    return _san(
+        "Watched agent-ticket #%d for project %s is closed.\n%s\n\n"
+        "Close summary: %s\n"
+        "Evidence pointer: %s\n"
+        "Correlation: %s\n\n"
+        "Before resuming the original task, run `agent-ticket closeout-check %d --strict` "
+        "and inspect the ticket evidence. Then acknowledge this callback with "
+        "`agent-ticket callbacks ack %s`."
+        % (
+            int(record["ticket_id"]),
+            project,
+            record.get("ticket_url") or "",
+            closeout.get("summary") or "closeout evidence unavailable",
+            record.get("ticket_url") or "agent-ticket show %d" % int(record["ticket_id"]),
+            watcher.get("correlation_id") or record.get("event_key"),
+            int(record["ticket_id"]),
+            record.get("event_key"),
+        )
+    )
+
+
+def _append_callback_attempt(record, stage, result):
+    j = result.get("json") or {}
+    attempt = {
+        "at": _utc_iso(),
+        "stage": stage,
+        "ok": bool(result.get("ok")),
+        "rc": result.get("rc"),
+        "reason": _probe_reason(result),
+        "session": j.get("session"),
+        "pane_state": j.get("pane_state"),
+    }
+    record.setdefault("delivery_attempts", []).append(attempt)
+    return attempt
+
+
+def _set_callback_pending(cfg, record, reason):
+    record["status"] = "pending"
+    record["pending_reason"] = reason
+    record["updated_at"] = _utc_iso()
+    _write_event_record(record)
+    audit_comment(
+        cfg,
+        record["ticket_id"],
+        "%s pending ticket.closed callback %s; reason=%s; outbox=%s"
+        % (_CALLBACK_COMMENT_PREFIX, record["event_key"], reason, _event_path(record["event_key"])),
+    )
+    return record
+
+
+def _attempt_callback_delivery(cfg, record):
+    event_key = record.get("event_key")
+    delivered_info = None
+    fd_event = _lock_event(event_key)
+    try:
+        current = _read_event_record(event_key) or record
+        if current.get("status") in ("delivered", "acknowledged", "superseded"):
+            return current
+        if current.get("status") == "delivering" and not _is_stale_delivering(current):
+            return current
+        current = _normalize_callback_record(current)
+        current["status"] = "delivering"
+        current["delivery_started_at"] = _utc_iso()
+        current.pop("pending_reason", None)
+        _write_event_record(current)
+
+        watcher = current.get("watcher") or {}
+        repo = watcher.get("origin_repo")
+        provider = watcher.get("origin_provider")
+        session = watcher.get("origin_session")
+        now = time.time()
+        if not repo:
+            return _set_callback_pending(cfg, current, "origin repo missing")
+        if float(watcher.get("expires_at_epoch") or 0) <= now:
+            return _set_callback_pending(cfg, current, "origin watcher expired at %s" % watcher.get("expires_at"))
+
+        message = _callback_message(current)
+        providers = [provider] if provider else DISPATCH_PROVIDERS
+        accepted = []
+        refused = []
+        for candidate in providers:
+            dry = _agent_contact(repo, candidate, message, dry_run=True, session=session)
+            attempt = _append_callback_attempt(current, "dry-run", dry)
+            attempt["provider"] = candidate
+            if dry.get("ok"):
+                accepted.append({"provider": candidate, "session": attempt.get("session") or session, "result": dry})
+            else:
+                refused.append("%s: %s" % (candidate, _probe_reason(dry)))
+        _write_event_record(current)
+        if not accepted:
+            return _set_callback_pending(cfg, current, "dry-run refused: %s" % ("; ".join(refused) or "no provider accepted"))
+        if len(accepted) > 1:
+            return _set_callback_pending(
+                cfg,
+                current,
+                "dry-run ambiguous providers: %s" % ", ".join("%s%s" % (
+                    a["provider"], (" session %s" % a["session"]) if a.get("session") else "") for a in accepted),
+            )
+
+        selected = accepted[0]
+        selected_provider = selected["provider"]
+        selected_session = selected.get("session") or session
+        sent = _agent_contact(repo, selected_provider, message, dry_run=False, session=selected_session)
+        sent_attempt = _append_callback_attempt(current, "send", sent)
+        sent_attempt["provider"] = selected_provider
+        if not sent.get("ok"):
+            _write_event_record(current)
+            return _set_callback_pending(cfg, current, "send refused: %s" % _probe_reason(sent))
+
+        delivered_session = sent_attempt.get("session") or selected_session or ((sent.get("json") or {}).get("session")) or "(auto-discovered)"
+        current["status"] = "delivered"
+        current["delivered_at"] = _utc_iso()
+        current["delivered_provider"] = selected_provider
+        current["delivered_session"] = delivered_session
+        current.pop("pending_reason", None)
+        current.pop("delivery_started_at", None)
+        _write_event_record(current)
+        delivered_info = {"provider": selected_provider, "session": delivered_session, "record": dict(current)}
+    finally:
+        _unlock_event(fd_event)
+
+    if delivered_info:
+        fd = _lock_watcher_store()
+        try:
+            store = _load_watcher_store(strict=True)
+            watcher_store = store.get("watchers", {}).get(str(int(delivered_info["record"]["ticket_id"])))
+            if watcher_store is not None:
+                delivered = list(watcher_store.get("delivered_events") or [])
+                if event_key not in delivered:
+                    delivered.append(event_key)
+                watcher_store["delivered_events"] = delivered
+                _save_watcher_store(store)
+        finally:
+            _unlock_watcher_store(fd)
+
+        audit_comment(
+            cfg,
+            delivered_info["record"]["ticket_id"],
+            "%s delivered ticket.closed callback %s to %s session %s"
+            % (_CALLBACK_COMMENT_PREFIX, event_key, delivered_info["provider"], delivered_info["session"]),
+        )
+        return delivered_info["record"]
+    return _read_event_record(event_key) or record
+
+
+def _notify_ticket_closed(cfg, task_id):
+    fd = _lock_watcher_store()
+    try:
+        store = _load_watcher_store(strict=True)
+        watcher = store.get("watchers", {}).get(str(int(task_id)))
+        if not watcher:
+            return []
+        if not watcher.get("last_event_key"):
+            return []
+        record = _read_event_record_strict(watcher["last_event_key"])
+    finally:
+        _unlock_watcher_store(fd)
+    if record.get("status") in ("pending", "closing") or _is_stale_delivering(record):
+        return [_attempt_callback_delivery(cfg, record)]
+    return [record]
+
+
+def _public_callback_record(record):
+    return {
+        "event_key": record.get("event_key"),
+        "event": record.get("event"),
+        "ticket_id": record.get("ticket_id"),
+        "revision": record.get("revision"),
+        "status": record.get("status"),
+        "pending_reason": record.get("pending_reason"),
+        "created_at": record.get("created_at"),
+        "delivered_at": record.get("delivered_at"),
+        "acknowledged_at": record.get("acknowledged_at"),
+        "superseded_at": record.get("superseded_at"),
+        "superseded_reason": record.get("superseded_reason"),
+        "delivered_provider": record.get("delivered_provider"),
+        "origin_repo": (record.get("watcher") or {}).get("origin_repo"),
+        "origin_provider": (record.get("watcher") or {}).get("origin_provider"),
+        "origin_session": (record.get("watcher") or {}).get("origin_session"),
+        "correlation_id": (record.get("watcher") or {}).get("correlation_id"),
+        "ticket_url": record.get("ticket_url"),
+        "outbox_path": _event_path(record.get("event_key", "")),
+    }
+
+
+def _load_outbox_records():
+    if not os.path.isdir(OUTBOX_DIR):
+        return []
+    records = []
+    for name in sorted(os.listdir(OUTBOX_DIR)):
+        if not name.endswith(".json"):
+            continue
+        data, _ = _read_json(os.path.join(OUTBOX_DIR, name))
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def _callback_matches_repo(record, repo):
+    if not repo:
+        return True
+    origin = ((record.get("watcher") or {}).get("origin_repo") or "").strip()
+    if not origin:
+        return False
+    expanded = os.path.expanduser(repo)
+    if os.path.isabs(expanded) or os.sep in expanded:
+        return os.path.realpath(origin) == os.path.realpath(expanded)
+    return os.path.basename(os.path.realpath(origin)) == repo
+
+
+def cmd_callbacks(cfg, args):
+    action = getattr(args, "action", "list")
+    if action in ("ack", "retry") and not getattr(args, "event_key", None):
+        sys.exit("agent-ticket: callbacks %s requires an event_key" % action)
+    if action == "ack":
+        fd = _lock_event(args.event_key)
+        try:
+            record = _read_event_record(args.event_key)
+            if not record:
+                sys.exit("agent-ticket: callback event %r not found" % args.event_key)
+            if record.get("status") == "superseded":
+                out(args, _public_callback_record(record),
+                    "Callback %s is superseded; no acknowledgement needed" % args.event_key)
+                return
+            record["status"] = "acknowledged"
+            record["acknowledged_at"] = _utc_iso()
+            record.pop("pending_reason", None)
+            record.pop("delivery_started_at", None)
+            _write_event_record(record)
+        finally:
+            _unlock_event(fd)
+        out(args, _public_callback_record(record), "Acknowledged callback %s" % args.event_key)
+        return
+    if action == "retry":
+        record = _read_event_record(args.event_key)
+        if not record:
+            sys.exit("agent-ticket: callback event %r not found" % args.event_key)
+        if record.get("status") in ("delivered", "acknowledged", "superseded"):
+            out(args, _public_callback_record(record),
+                "Callback %s is already %s" % (args.event_key, record.get("status")))
+            return
+        retry_cfg = cfg or load_config()
+        updated = _attempt_callback_delivery(retry_cfg, record)
+        out(args, _public_callback_record(updated),
+            "Callback %s is %s" % (args.event_key, updated.get("status")))
+        return
+
+    records = _load_outbox_records()
+    if getattr(args, "pending", False):
+        records = [_normalize_callback_record(r) for r in records]
+        records = [r for r in records if r.get("status") in ("pending", "closing") or _is_stale_delivering(r)]
+    if getattr(args, "repo", None):
+        records = [r for r in records if _callback_matches_repo(r, args.repo)]
+    public = [_public_callback_record(r) for r in records]
+    if args.json:
+        print(json.dumps(public, indent=2))
+        return
+    for r in public:
+        label = "Delivered" if r.get("status") == "delivered" else "Pending"
+        print(
+            "%s agent-ticket callback %s for #%s: %s%s"
+            % (
+                label,
+                r["event_key"],
+                r["ticket_id"],
+                r.get("pending_reason") or r.get("status"),
+                (" (%s)" % r.get("ticket_url")) if r.get("ticket_url") else "",
+            )
+        )
+        if r.get("status") != "delivered":
+            print("  Run `agent-ticket closeout-check %s --strict` before resuming the original task." % r["ticket_id"])
+            print("  Then acknowledge with `agent-ticket callbacks ack %s`." % r["event_key"])
+
+
+# ---- dispatch helpers ----------------------------------------------------
+
+def project_tag(tags):
+    """Return the project:<name> value from a tag list (first one), or None."""
+    for t in tags:
+        if t.startswith("project:"):
+            return t[len("project:"):]
+    return None
+
+
+def project_tags(tags):
+    return [t[len("project:"):] for t in tags if t.startswith("project:")]
+
+
+def severity_tag(tags):
+    for value in SEVERITY_CHOICES:
+        if value in tags:
+            return value
+    return ""
+
+
+def resolve_repo_path(cfg, name):
+    """Find the SOURCE repo dir for a project tag by checking each configured
+    repo_root for a <name> subdir; first hit wins. Returns an absolute path or None.
+    The project name must be a single directory basename — no path separators, no
+    `.`/`..`, no leading dot — so a crafted tag like `project:../other` (or
+    `project:/etc`) can't escape repo_roots."""
+    if not name or os.sep in name or (os.altsep and os.altsep in name) \
+       or name in (".", "..") or name.startswith("."):
+        return None
+    for root in cfg.get("repo_roots") or DEFAULT_REPO_ROOTS:
+        root_real = os.path.realpath(os.path.expanduser(root))
+        cand_real = os.path.realpath(os.path.join(root_real, name))
+        # require the resolved repo to stay inside the resolved root — a symlink
+        # under repo_roots pointing elsewhere does NOT count.
+        if os.path.isdir(cand_real) and (cand_real == root_real or cand_real.startswith(root_real + os.sep)):
+            return cand_real
+    return None
+
+
+_TITLE_WS_RE = re.compile(r"\s+")
+_TITLE_TOK_RE = re.compile(r"[a-z0-9]+")
+_TITLE_STOPWORDS = frozenset((
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "be", "it",
+    "this", "that", "with", "when", "while", "as", "at", "by", "from", "not", "no", "doesnt",
+    "doesn", "wont", "cant", "didnt", "does", "do",
+))
+
+
+def _norm_title(s):
+    return _TITLE_WS_RE.sub(" ", (s or "").strip().casefold())
+
+
+def _content_tokens(s):
+    return [t for t in _TITLE_TOK_RE.findall(s) if t not in _TITLE_STOPWORDS]
+
+
+def _is_strong_dup(a, b):
+    """Heuristic: is title `a` likely the same ticket as already-open title `b`?
+    After casefold + whitespace-collapse: strong iff identical; OR one is a
+    substring of the other and the shorter is >= DUP_MIN_LEN chars; OR they share
+    a run of >= 4 consecutive *content* tokens (stopwords stripped). Deliberately
+    conservative — a short generic title like "bug" never trips it, and a generic
+    phrase like "the cli flag doesnt" reduces to a 1-content-token run."""
+    na, nb = _norm_title(a), _norm_title(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    short, lng = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(short) >= DUP_MIN_LEN and short in lng:
+        return True
+    ta, tb = _content_tokens(na), _content_tokens(nb)
+    for i in range(len(ta) - 3):
+        run = ta[i:i + 4]
+        for j in range(len(tb) - 3):
+            if tb[j:j + 4] == run:
+                return True
+    return False
+
+
+def _agent_contact(repo, provider, message, dry_run=False, session=None):
+    """Invoke `agent-contact send` (the GUARDED cross-agent contact). Never
+    sys.exits — dispatch must degrade. Returns a dict:
+      { ok: bool(rc==0), rc: int, json: <parsed stdout or None>, stderr: str, raw: str }"""
+    argv = ["agent-contact", "send", "--repo", repo, "--provider", provider, "--message", message, "--json"]
+    if dry_run:
+        argv.append("--dry-run")
+    if session:
+        argv += ["--session", session]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=25)
+    except FileNotFoundError:
+        return {"ok": False, "rc": 127, "json": None, "stderr": "agent-contact not found on PATH", "raw": ""}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": -1, "json": None, "stderr": "agent-contact timed out after 25s", "raw": ""}
+    except (OSError, ValueError) as e:   # PermissionError, ENOEXEC, embedded-NUL in argv, etc. — never propagate
+        return {"ok": False, "rc": -2, "json": None, "stderr": "agent-contact could not be run: %s" % e, "raw": ""}
+    raw = (p.stdout or "").strip()
+    try:
+        j = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        j = None
+    return {"ok": p.returncode == 0, "rc": p.returncode, "json": j, "stderr": (p.stderr or "").strip(), "raw": raw}
+
+
+def _agent_tmux(argv, timeout=25):
+    """Run agent-tmux for supervised owner-agent orchestration. Returns a dict
+    instead of exiting so callers can report refusal/tooling states explicitly."""
+    full = ["agent-tmux"] + list(argv)
+    try:
+        p = subprocess.run(full, capture_output=True, text=True, errors="replace", timeout=timeout)
+    except FileNotFoundError:
+        return {"ok": False, "rc": 127, "stdout": "", "stderr": "agent-tmux not found on PATH", "argv": full}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": -1, "stdout": "", "stderr": "agent-tmux timed out after %ss" % timeout, "argv": full}
+    except (OSError, ValueError) as e:
+        return {"ok": False, "rc": -2, "stdout": "", "stderr": "agent-tmux could not be run: %s" % e, "argv": full}
+    return {"ok": p.returncode == 0, "rc": p.returncode, "stdout": (p.stdout or "").strip(),
+            "stderr": (p.stderr or "").strip(), "argv": full}
+
+
+def _probe_reason(r):
+    """A human reason string for a non-contactable agent-contact result."""
+    j = r.get("json") or {}
+    reason = j.get("reason") or j.get("pane_reason") or r.get("stderr") or ("rc=%s" % r.get("rc"))
+    if j.get("session"):
+        reason = "%s [session %s, state %s]" % (reason, j["session"], j.get("pane_state", "?"))
+    return reason or "unknown"
+
+
+def _classify_probe(r):
+    """From a `_agent_contact(..., dry_run=True)` result, decide if this provider
+    has a contactable session. Returns ("ok", session_name_or_None) or ("no", reason).
+    Trusts rc==0 = contactable (agent-contact refuses with a non-zero rc)."""
+    if r.get("ok"):
+        sess = (r.get("json") or {}).get("session")
+        return ("ok", sess)   # sess may be None — the real send will re-discover
+    return ("no", _probe_reason(r))
+
+
+def _first_output_token(text):
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped.split()[0]
+    return None
+
+
+def _safe_session_name(prefix, project):
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "-", (project or "ticket").strip()).strip(".-")
+    if not base:
+        base = "ticket"
+    pref = re.sub(r"[^A-Za-z0-9_.-]+", "-", (prefix or "owner").strip()).strip(".-") or "owner"
+    return ("%s-%s" % (pref, base))[:80]
+
+
+def _supervise_launch_session_name(prefix, project, task_id):
+    return _safe_session_name(prefix, "%s-%d" % (project or "ticket", int(task_id)))
+
+
+def _ticket_comments(cfg, task_id):
+    return rpc(cfg, "getAllComments", {"task_id": int(task_id)}) or []
+
+
+def _comments_text(comments):
+    return "\n".join(str(c.get("comment") or "") for c in comments)
+
+
+def _git_worktree_info(repo):
+    info = {"available": False, "repo": repo}
+    if not repo or not os.path.isdir(repo):
+        info["error"] = "repo path is not a directory"
+        return info
+    try:
+        top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, errors="replace", timeout=5)
+    except FileNotFoundError:
+        info["error"] = "git executable not found"
+        return info
+    except subprocess.TimeoutExpired:
+        info["error"] = "git rev-parse timed out"
+        return info
+    except (OSError, ValueError) as e:
+        info["error"] = str(e)
+        return info
+    if top.returncode != 0:
+        info["error"] = _first_line(top.stderr) or _first_line(top.stdout) or "git rev-parse failed"
+        return info
+    info["available"] = True
+    info["toplevel"] = top.stdout.strip()
+    status = subprocess.run(["git", "-C", repo, "status", "--short"],
+                            capture_output=True, text=True, errors="replace", timeout=5)
+    if status.returncode == 0:
+        lines = status.stdout.splitlines()
+        info["clean"] = not lines
+        info["status_short"] = lines
+    else:
+        info["clean"] = False
+        info["status_error"] = _first_line(status.stderr) or _first_line(status.stdout)
+    head = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True, errors="replace", timeout=5)
+    if head.returncode == 0:
+        info["head"] = head.stdout.strip()
+    return info
+
+
+def _resolve_ticket_repo(cfg, tags):
+    pname = project_tag(tags)
+    return pname, resolve_repo_path(cfg, pname) if pname else None
+
+
+def _closeout_report(cfg, task_id, require_validation=False, require_commit=False,
+                     require_install=False, require_clean=False, strict=False):
+    t = get_task_in_project(cfg, task_id)
+    tags = task_tags(cfg, task_id)
+    comments = _ticket_comments(cfg, task_id)
+    text = _comments_text(comments)
+    pname, repo = _resolve_ticket_repo(cfg, tags)
+    checks = []
+
+    def add(name, status, detail, required=False):
+        checks.append({"name": name, "status": status, "detail": detail, "required": bool(required)})
+
+    closed = not _task_is_active(t)
+    add("ticket_closed", "pass" if closed else "fail",
+        "ticket is closed" if closed else "ticket is still open", True)
+
+    col = column_name(cfg, t["column_id"])
+    add("ticket_column", "pass" if col == "Done" else "warn",
+        "column is %s" % col, False)
+
+    add("repo_resolved", "pass" if repo else "warn",
+        repo or ("no repo resolved from project tag %r" % (pname or "")), require_clean)
+
+    git_info = _git_worktree_info(repo) if repo else {"available": False, "error": "no repo resolved"}
+    if git_info.get("available"):
+        dirty = not git_info.get("clean", False)
+        add("worktree_clean", "fail" if dirty else "pass",
+            "dirty paths: %s" % ", ".join(git_info.get("status_short", [])[:8]) if dirty else "worktree clean",
+            True)
+        if git_info.get("head"):
+            add("git_head", "pass", git_info["head"], False)
+    else:
+        add("worktree_clean", "warn", git_info.get("error") or "git unavailable", require_clean)
+
+    validation_seen = bool(_VALIDATION_RE.search(text))
+    add("validation_evidence", "pass" if validation_seen else "fail",
+        "validation evidence found in comments" if validation_seen else "no validation evidence found in comments",
+        strict or require_validation)
+
+    commit_match = _COMMIT_RE.search(text)
+    commit_seen = bool(commit_match or git_info.get("head"))
+    commit_detail = (commit_match.group(1) or commit_match.group(2)) if commit_match else git_info.get("head")
+    add("commit_id", "pass" if commit_seen else "warn",
+        commit_detail or "no commit id found in comments and no git HEAD available",
+        require_commit)
+
+    install_seen = bool(_INSTALL_RE.search(text))
+    add("install_sync_evidence", "pass" if install_seen else "warn",
+        "install/sync evidence found in comments" if install_seen else "no install/sync evidence found in comments",
+        require_install)
+
+    ok = True
+    for check in checks:
+        if check["status"] == "fail" and (check["required"] or strict):
+            ok = False
+        if check["status"] == "warn" and check["required"]:
+            ok = False
+
+    return {
+        "ok": ok,
+        "ticket": int(task_id),
+        "project": pname,
+        "repo": repo,
+        "closed": closed,
+        "column": col,
+        "git": git_info,
+        "checks": checks,
+    }
+
+
+def _format_closeout_report(report):
+    lines = ["closeout-check #%s: %s" % (report["ticket"], "pass" if report["ok"] else "blocked")]
+    for check in report["checks"]:
+        req = " required" if check.get("required") else ""
+        lines.append("  - %s%s: %s (%s)" % (check["status"], req, check["name"], _san(check["detail"])))
+    return "\n".join(lines)
+
+
+# ---- commands ------------------------------------------------------------
+
+def cmd_new(cfg, args):
+    if getattr(args, "watch_origin", False) and not getattr(args, "dispatch", False):
+        sys.exit("agent-ticket: --watch-origin on `new` requires --dispatch; use `supervise --watch-origin` for existing tickets.")
+    # --- duplicate check (warn, don't hard-block; --force overrides) --------
+    if args.project and not getattr(args, "force", False):
+        open_tasks = _all_tasks(cfg, include_closed=False)
+        if len(open_tasks) > 80:   # don't make `new` slow/fragile on a huge board (advisory only)
+            sys.stderr.write("agent-ticket: note — %d open tickets; skipping duplicate check (use --force to suppress, "
+                             "or check `agent-ticket list --project %s` yourself).\n" % (len(open_tasks), args.project))
+            open_tasks = []
+        for t in open_tasks:
+            if ("project:" + args.project) not in task_tags(cfg, t["id"]):
+                continue
+            if _is_strong_dup(args.title, t.get("title", "")):
+                url = web_url(cfg, "task/%d" % int(t["id"]))
+                out(args, {"created": False, "duplicate_of": t["id"], "url": url},
+                    "⚠ possible duplicate of #%s — %s (open, project:%s)\n  %s\n"
+                    "  File anyway with --force, or comment on it:  agent-ticket comment %s '...'"
+                    % (t["id"], _san(t.get("title", "")), args.project, url, t["id"]))
+                sys.exit(0)   # declined to act — not a crash
+    # --- create ------------------------------------------------------------
+    tags = list(args.tag or [])
+    if args.project:
+        tags.append("project:" + args.project)
+    if args.agent:
+        tags.append("agent:" + args.agent)
+    if args.severity:
+        tags.append(args.severity)
+    params = {
+        "title": args.title,
+        "project_id": cfg["project_id"],
+        "column_id": resolve_column_id(cfg, args.column),
+        "description": expand_escapes(args.body),
+        "tags": tags,
+    }
+    cid = resolve_category_id(cfg, args.kind)
+    if cid:
+        params["category_id"] = cid
+    task_id = rpc(cfg, "createTask", params)
+    if not task_id:
+        sys.exit("agent-ticket: createTask failed")
+    task = rpc(cfg, "getTask", {"task_id": int(task_id)})
+    url = web_url(cfg, "task/%d" % int(task_id))
+    new_obj = {"task": task, "tags": task_tags(cfg, task_id), "url": url}
+    new_human = "Created ticket #%s — %s\n  %s" % (task_id, _san(args.title), url)
+    watcher = _register_origin_watcher(cfg, task_id, args, "new --dispatch" if getattr(args, "dispatch", False) else "new")
+    if watcher:
+        new_obj["watcher"] = watcher
+    # --- optional: ping the owner agent right after filing -----------------
+    if not getattr(args, "dispatch", False):
+        out(args, new_obj, new_human); return
+    d_args = argparse.Namespace(
+        id=int(task_id),
+        severity=args.severity,
+        dry_run=False,
+        json=getattr(args, "json", False),
+    )
+    if getattr(args, "json", False):
+        # emit ONE combined JSON object (not two concatenated ones)
+        try:
+            d_result = cmd_dispatch(cfg, d_args, return_dict=True)
+        except SystemExit as e:   # not expected with return_dict=True, but be safe
+            d_result = {"dispatched": False, "reason": "skipped: %s" % e}
+        print(json.dumps({**new_obj, "dispatch": d_result}, indent=2))
+    else:
+        print(new_human)
+        try:
+            cmd_dispatch(cfg, d_args)
+        except SystemExit as e:
+            # cmd_dispatch hard-errors only on a "Needs human" ticket (here, only if --column "Needs human"
+            # was passed alongside --dispatch). The ticket was created; don't fail `new` over it.
+            if str(e):
+                sys.stderr.write("agent-ticket: (dispatch skipped) %s\n" % e)
+
+
+def _fmt_task(cfg, t, tags):
+    return "#%-4s [%s] %-14s %s%s" % (
+        t["id"],
+        _san(category_name(cfg, t.get("category_id"))) or "-",
+        _san(column_name(cfg, t["column_id"])),
+        _san(t["title"]),
+        ("  {" + ", ".join(_san(x) for x in tags) + "}") if tags else "",
+    )
+
+
+def _all_tasks(cfg, include_closed):
+    open_t = rpc(cfg, "getAllTasks", {"project_id": cfg["project_id"], "status_id": 1}) or []
+    if not include_closed:
+        return open_t
+    closed_t = rpc(cfg, "getAllTasks", {"project_id": cfg["project_id"], "status_id": 0}) or []
+    return open_t + closed_t
+
+
+def cmd_list(cfg, args):
+    tasks = _all_tasks(cfg, args.all)
+    if args.column:
+        col_id = resolve_column_id(cfg, args.column)
+        tasks = [t for t in tasks if int(t["column_id"]) == col_id]
+    if args.kind:
+        cid = resolve_category_id(cfg, args.kind, create=False)
+        tasks = [] if cid is None else [t for t in tasks if int(t.get("category_id") or 0) == cid]
+    # tags are needed for display and for --project/--agent filtering; fetch once each
+    tags_by_id = {t["id"]: task_tags(cfg, t["id"]) for t in tasks}
+    if args.project:
+        want = "project:" + args.project
+        tasks = [t for t in tasks if want in tags_by_id[t["id"]]]
+    if args.agent:
+        want = "agent:" + args.agent
+        tasks = [t for t in tasks if want in tags_by_id[t["id"]]]
+    if args.json:
+        print(json.dumps([{**t, "tags": tags_by_id[t["id"]],
+                           "url": web_url(cfg, "task/%d" % int(t["id"]))} for t in tasks], indent=2))
+        return
+    if not tasks:
+        print("(no tickets)"); return
+    for t in tasks:
+        print(_fmt_task(cfg, t, tags_by_id[t["id"]]))
+
+
+def cmd_show(cfg, args):
+    t = get_task_in_project(cfg, args.id)
+    tags = task_tags(cfg, args.id)
+    comments = rpc(cfg, "getAllComments", {"task_id": args.id}) or []
+    url = web_url(cfg, "task/%d" % int(args.id))
+    if args.json:
+        print(json.dumps({"task": t, "tags": tags, "comments": comments, "url": url}, indent=2)); return
+    print("Ticket #%s — %s" % (t["id"], _san(t["title"])))
+    print("  status:   %s / column: %s" % ("open" if t["is_active"] else "closed", _san(column_name(cfg, t["column_id"]))))
+    print("  kind:     %s" % (_san(category_name(cfg, t.get("category_id"))) or "-"))
+    print("  tags:     %s" % (", ".join(_san(x) for x in tags) or "-"))
+    print("  url:      %s" % url)
+    if t.get("description"):
+        print("\n%s\n" % _san(t["description"]))
+    if comments:
+        print("Comments:")
+        for c in comments:
+            who = _san(c.get("name") or c.get("username") or "?")
+            print("  - [%s] %s" % (who, _san(c["comment"]).replace("\n", "\n    ")))
+
+
+def cmd_comment(cfg, args):
+    get_task_in_project(cfg, args.id)
+    res = _ok(rpc(cfg, "createComment", {"task_id": args.id, "user_id": cfg["comment_user_id"],
+                                         "content": expand_escapes(args.text)}), "comment on #%s" % args.id)
+    out(args, {"comment_id": res}, "Added comment to #%s" % args.id)
+
+
+def cmd_move(cfg, args):
+    t = get_task_in_project(cfg, args.id)
+    move_task_to_column(cfg, t, args.column)
+    out(args, {"moved": True}, "Moved #%s -> %s" % (args.id, args.column))
+
+
+def cmd_close(cfg, args):
+    t = get_task_in_project(cfg, args.id)
+    _preflight_ticket_closed_callback(args.id)
+    reserved_callback = _reserve_ticket_closed_callback(cfg, args.id)
+    move_task_to_column(cfg, t, "Done", "move #%s -> Done before close" % args.id)
+    closed_now = False
+    if _task_is_active(t):
+        _ok(rpc(cfg, "closeTask", {"task_id": args.id}), "close #%s" % args.id)
+        closed_now = True
+    callbacks = [_attempt_callback_delivery(cfg, reserved_callback)] if reserved_callback else []
+    out(args, {"closed": True, "column": "Done", "closed_now": closed_now,
+               "callbacks": [_public_callback_record(r) for r in callbacks if r]},
+        "Closed #%s -> Done" % args.id)
+
+
+def cmd_reopen(cfg, args):
+    t = get_task_in_project(cfg, args.id)
+    reopened_now = False
+    if not _task_is_active(t):
+        _ok(rpc(cfg, "openTask", {"task_id": args.id}), "reopen #%s" % args.id)
+        reopened_now = True
+    target = args.column
+    move_task_to_column(cfg, t, target, "move reopened #%s -> %s" % (args.id, target))
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+    _ok(rpc(cfg, "createComment", {
+        "task_id": args.id,
+        "user_id": cfg["comment_user_id"],
+        "content": "%s moved to %s at %s" % (_REOPEN_COMMENT_PREFIX, target, stamp),
+    }), "audit comment for reopen #%s" % args.id)
+    callback_state = _mark_ticket_reopened_for_callbacks(args.id)
+    superseded = (callback_state or {}).get("superseded_event") if isinstance(callback_state, dict) else None
+    if superseded and superseded.get("status") == "superseded":
+        audit_comment(cfg, args.id, "%s superseded callback %s because ticket reopened"
+                      % (_CALLBACK_COMMENT_PREFIX, superseded.get("event_key")))
+    out(args, {"reopened": True, "reopened_now": reopened_now, "column": target},
+        "Reopened #%s -> %s" % (args.id, target))
+
+
+def cmd_columns(cfg, args):
+    cols = rpc(cfg, "getColumns", {"project_id": cfg["project_id"]})
+    if args.json:
+        print(json.dumps(cols, indent=2)); return
+    for c in cols:
+        print("%2d. %s" % (c["position"], _san(c["title"])))
+
+
+def cmd_closeout_check(cfg, args):
+    report = _closeout_report(
+        cfg,
+        args.id,
+        require_validation=args.require_validation,
+        require_commit=args.require_commit,
+        require_install=args.require_install,
+        require_clean=args.require_clean,
+        strict=args.strict,
+    )
+    if args.comment:
+        audit_comment(cfg, args.id, _format_closeout_report(report))
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(_format_closeout_report(report))
+    if not report["ok"] and args.fail:
+        sys.exit(2)
+
+
+def _supervision_message(cfg, task_id, pname, title, args):
+    extra = ("\n\nSupervisor note:\n%s" % args.message) if args.message else ""
+    return _san(
+        "Ticket #%d filed against this repo (project %s): %s\n%s\n\n"
+        "Please take ownership if appropriate: move the ticket to 'Agent working', work from SOURCE only, "
+        "validate the exact requested behavior, and comment evidence before closing.\n\n"
+        "Closeout gate before `agent-ticket close %d`:\n"
+        "- validation commands and results are commented on the ticket\n"
+        "- source worktree is clean when repo-owned source changed\n"
+        "- commit id or current HEAD is reported when source changed\n"
+        "- install/rollout/sync evidence is commented when installed artifacts changed\n"
+        "- run `agent-ticket closeout-check %d --strict` if available and address blockers\n"
+        "%s"
+        % (int(task_id), pname, title or "(no title)", web_url(cfg, "task/%d" % int(task_id)),
+           int(task_id), int(task_id), extra)
+    )
+
+
+def _batch_ticket_summary(cfg, ticket, tags, column=None, kind=None):
+    column = column or column_name(cfg, ticket["column_id"])
+    kind = kind if kind is not None else category_name(cfg, ticket.get("category_id"))
+    return {
+        "id": int(ticket["id"]),
+        "title": _san(ticket.get("title", "")),
+        "severity": severity_tag(tags),
+        "kind": kind or "",
+        "column": column,
+        "column_id": int(ticket.get("column_id") or 0),
+        "swimlane_id": int(ticket.get("swimlane_id") or 1),
+        "tags": list(tags),
+        "url": web_url(cfg, "task/%d" % int(ticket["id"])),
+    }
+
+
+def _batch_ticket_sort_key(item):
+    severity_rank = {"p1": 0, "p2": 1, "": 2, "p3": 3}
+    return (severity_rank.get(item.get("severity") or "", 2), int(item["id"]))
+
+
+def _batch_include_done_column(args):
+    columns = getattr(args, "column", None) or []
+    return "Done" in columns
+
+
+def _batch_include_needs_human(args):
+    columns = getattr(args, "column", None) or []
+    return bool(getattr(args, "include_needs_human", False) or "Needs human" in columns)
+
+
+def _batch_include_p3(args):
+    severities = getattr(args, "severity", None) or []
+    return bool(getattr(args, "include_p3", False) or "p3" in severities)
+
+
+def _batch_refusal_detail(refusals):
+    return "; ".join("%s: %s" % (r.get("provider"), r.get("reason")) for r in refusals)
+
+
+def _batch_contact_absence_repo(reason):
+    match = re.search(r"\bno tmux-managed\b.*\bpane found for\s+(.+?)\s*$", reason or "", re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+
+def _batch_refusal_is_safe_absence(refusal, expected_repo=None):
+    probe = refusal.get("probe") or {}
+    payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
+    reason = str(refusal.get("reason") or payload.get("reason") or payload.get("pane_reason") or probe.get("stderr") or "")
+    reported_repo = _batch_contact_absence_repo(reason)
+    if not reported_repo:
+        return False
+    if expected_repo is None:
+        return True
+    return os.path.realpath(os.path.expanduser(reported_repo)) == os.path.realpath(os.path.expanduser(str(expected_repo)))
+
+
+def _batch_unsafe_contact_refusals(refusals, expected_repo=None):
+    return [r for r in refusals if not _batch_refusal_is_safe_absence(r, expected_repo)]
+
+
+def _batch_tmux_text(result):
+    return ("%s\n%s" % (result.get("stdout", ""), result.get("stderr", ""))).strip()
+
+
+def _batch_absence_workdir_matches(line, prefix, expected_repo=None):
+    if not line.startswith(prefix):
+        return False
+    if expected_repo is None:
+        return True
+    reported = line[len(prefix):].strip()
+    return os.path.realpath(os.path.expanduser(reported)) == os.path.realpath(os.path.expanduser(str(expected_repo)))
+
+
+def _batch_codex_existing_is_absent(result, expected_repo=None):
+    if result.get("ok"):
+        return False
+    stderr_lines = (result.get("stderr") or "").strip().splitlines()
+    prefix = "agent-tmux: no Codex tmux session found for workdir:"
+    return bool(
+        int(result.get("rc") or 0) == 1
+        and not (result.get("stdout") or "").strip()
+        and len(stderr_lines) == 1
+        and _batch_absence_workdir_matches(stderr_lines[0], prefix, expected_repo)
+    )
+
+
+def _batch_codex_latest_is_absent(result, expected_repo=None):
+    if result.get("ok"):
+        return False
+    stderr_lines = (result.get("stderr") or "").strip().splitlines()
+    prefix = "agent-tmux: no Codex session found for workdir:"
+    return bool(
+        int(result.get("rc") or 0) == 1
+        and not (result.get("stdout") or "").strip()
+        and len(stderr_lines) == 1
+        and _batch_absence_workdir_matches(stderr_lines[0], prefix, expected_repo)
+    )
+
+
+def _batch_tmux_failure_detail(result):
+    return _first_line(result.get("stderr")) or _first_line(result.get("stdout")) or "agent-tmux exited rc=%s" % result.get("rc")
+
+
+def _batch_valid_codex_latest_output(result):
+    if (result.get("stderr") or "").strip():
+        return False
+    lines = (result.get("stdout") or "").strip().splitlines()
+    if len(lines) != 1:
+        return False
+    parts = lines[0].split("\t")
+    return len(parts) == 4 and all(part.strip() for part in parts)
+
+
+def _batch_codex_existing_block(group, refused):
+    existing = _agent_tmux(["codex-existing", group["repo"]], timeout=10)
+    if existing.get("ok"):
+        return {
+            "status": "blocked",
+            "reason": "existing session unsafe",
+            "detail": "codex-existing reported %s, but agent-contact did not accept a safe send target: %s"
+                      % (_first_output_token(existing.get("stdout")) or "an existing session",
+                         _batch_refusal_detail(refused) or "no contactable session"),
+            "provider": "codex",
+            "session": _first_output_token(existing.get("stdout")),
+            "refused": refused,
+            "existing": existing,
+        }, existing
+    existing_text = _batch_tmux_text(existing).lower()
+    if "multiple" in existing_text or "refusing to guess" in existing_text:
+        detail = _first_line(existing.get("stderr")) or _first_line(existing.get("stdout")) or "agent-tmux refused to choose an existing session"
+        detail = "%s Resolve by leaving exactly one safe tmux-managed owner session for this repo, or closing/renaming stale same-repo sessions before retrying." % detail
+        return {
+            "status": "blocked",
+            "reason": "ambiguous existing sessions",
+            "detail": detail,
+            "provider": "codex",
+            "session": None,
+            "refused": refused,
+            "existing": existing,
+        }, existing
+    if not _batch_codex_existing_is_absent(existing, group["repo"]):
+        return {
+            "status": "blocked",
+            "reason": "agent-tmux existing lookup failed",
+            "detail": _batch_tmux_failure_detail(existing),
+            "provider": "codex",
+            "session": None,
+            "refused": refused,
+            "existing": existing,
+        }, existing
+    return None, existing
+
+
+def _batch_group_project_label(group):
+    projects = group.get("projects") or []
+    if projects:
+        return ", ".join(projects)
+    return group.get("project") or ""
+
+
+def _batch_skip(ticket, reason, project=None, blocking=False):
+    item = {
+        "ticket_id": int(ticket["id"]),
+        "title": _san(ticket.get("title", "")),
+        "reason": reason,
+    }
+    if project:
+        item["project"] = project
+    if blocking:
+        item["blocking"] = True
+    return item
+
+
+def _batch_blocking_skips(skipped):
+    return [item for item in skipped if item.get("blocking")]
+
+
+def _batch_collect_ticket_groups(cfg, args):
+    tasks = _all_tasks(cfg, include_closed=False)
+    groups_by_repo = {}
+    skipped = []
+    wanted_projects = set(getattr(args, "project", None) or [])
+    wanted_severities = set(getattr(args, "severity", None) or [])
+    wanted_columns = set(getattr(args, "column", None) or [])
+    wanted_tags = set(getattr(args, "tag", None) or [])
+    wanted_kinds = set(getattr(args, "kind", None) or [])
+
+    for ticket in tasks:
+        tid = int(ticket["id"])
+        column = column_name(cfg, ticket["column_id"])
+        if wanted_columns and column not in wanted_columns:
+            continue
+        if not wanted_columns and column == "Done" and not _batch_include_done_column(args):
+            skipped.append(_batch_skip(ticket, "Done column"))
+            continue
+        if column == "Needs human" and not _batch_include_needs_human(args):
+            skipped.append(_batch_skip(ticket, "Needs human"))
+            continue
+
+        tags = task_tags(cfg, tid)
+
+        severity = severity_tag(tags)
+        if wanted_severities and severity not in wanted_severities:
+            continue
+        if severity == "p3" and not _batch_include_p3(args):
+            skipped.append(_batch_skip(ticket, "p3 excluded"))
+            continue
+        if wanted_tags and not wanted_tags.issubset(set(tags)):
+            continue
+
+        kind = category_name(cfg, ticket.get("category_id")) or ""
+        if wanted_kinds and kind not in wanted_kinds:
+            continue
+
+        ptags = project_tags(tags)
+        if wanted_projects:
+            if not ptags or not (set(ptags) & wanted_projects):
+                continue
+        if len(ptags) != 1:
+            skipped.append(_batch_skip(
+                ticket,
+                "missing project tag" if not ptags else "multiple project tags: %s" % ", ".join(ptags),
+                blocking=True,
+            ))
+            continue
+        project = ptags[0]
+        if wanted_projects and project not in wanted_projects:
+            continue
+
+        repo = resolve_repo_path(cfg, project)
+        if not repo:
+            skipped.append(_batch_skip(ticket, "unresolved repo", project=project, blocking=True))
+            continue
+
+        item = _batch_ticket_summary(cfg, ticket, tags, column=column, kind=kind)
+        item["project"] = project
+        item["repo"] = repo
+        group = groups_by_repo.setdefault(repo, {
+            "project": project,
+            "projects": [],
+            "repo": repo,
+            "session_key": os.path.basename(repo) or project,
+            "tickets": [],
+        })
+        if project not in group["projects"]:
+            group["projects"].append(project)
+        group["tickets"].append(item)
+
+    groups = []
+    for group in groups_by_repo.values():
+        group["projects"] = sorted(group["projects"])
+        group["project"] = group["projects"][0] if len(group["projects"]) == 1 else ",".join(group["projects"])
+        group["tickets"] = sorted(group["tickets"], key=_batch_ticket_sort_key)
+        groups.append(group)
+    groups.sort(key=lambda g: (_batch_group_project_label(g), g["repo"]))
+    skipped.sort(key=lambda s: int(s["ticket_id"]))
+    return groups, skipped
+
+
+def _batch_supervision_message(cfg, group, args):
+    project_label = _batch_group_project_label(group)
+    closeout_flags = []
+    if getattr(args, "strict_closeout", False):
+        closeout_flags.append("--strict")
+    if getattr(args, "require_clean", False):
+        closeout_flags.append("--require-clean")
+    if getattr(args, "require_validation", False):
+        closeout_flags.append("--require-validation")
+    if getattr(args, "require_commit", False):
+        closeout_flags.append("--require-commit")
+    if getattr(args, "require_install", False):
+        closeout_flags.append("--require-install")
+    closeout_cmd = "agent-ticket closeout-check <id>%s" % ((" " + " ".join(closeout_flags)) if closeout_flags else "")
+    lines = [
+        "Batch agent-ticket queue for project %s" % project_label,
+        "Repo: %s" % group["repo"],
+        "",
+        "Process these tickets sequentially in this exact order in one worktree. Do not dispatch or fan out to another worker.",
+        "For each ticket: move it to 'Agent working' when starting, work from SOURCE only, validate the exact requested behavior, install/roll out if source-owned installed artifacts change, comment validation/install evidence, close the ticket, then continue to the next ticket. The supervisor runs closeout-check after closure.",
+        "",
+        "Queue:",
+    ]
+    for idx, ticket in enumerate(group["tickets"], 1):
+        meta = ", ".join(x for x in (
+            "project:%s" % ticket.get("project") if ticket.get("project") else "",
+            ticket.get("severity"),
+            ticket.get("kind"),
+            ticket.get("column"),
+        ) if x)
+        lines.append("%d. #%d [%s] %s" % (idx, ticket["id"], meta or "-", ticket["title"]))
+        lines.append("   %s" % ticket["url"])
+    if getattr(args, "message", ""):
+        lines.extend(["", "Supervisor note:", args.message])
+    lines.extend([
+        "",
+        "Closeout gate for every ticket:",
+        "- validation commands and results are commented on the ticket",
+        "- source worktree is clean when repo-owned source changed",
+        "- commit id or current HEAD is reported when source changed",
+        "- install/rollout/sync evidence is commented when installed artifacts changed",
+        "- the supervisor will run `%s` after closure; address any reported blockers" % closeout_cmd,
+    ])
+    return _san("\n".join(lines))
+
+
+def _batch_revalidate_group_for_route(cfg, args, group, context="route"):
+    refreshed = []
+    wanted_projects = set(getattr(args, "project", None) or [])
+    wanted_severities = set(getattr(args, "severity", None) or [])
+    wanted_columns = set(getattr(args, "column", None) or [])
+    wanted_tags = set(getattr(args, "tag", None) or [])
+    wanted_kinds = set(getattr(args, "kind", None) or [])
+
+    def stale(ticket, reason):
+        return None, "#%s %s" % (ticket.get("id"), reason)
+
+    for ticket in group.get("tickets", []):
+        try:
+            current = get_task_in_project(cfg, ticket["id"])
+            tags = task_tags(cfg, ticket["id"])
+        except SystemExit as e:
+            return stale(ticket, "could not be re-read before %s: %s" % (context, e))
+        if not _task_is_active(current):
+            return stale(ticket, "closed before %s" % context)
+        ptags = project_tags(tags)
+        if len(ptags) != 1 or ptags[0] != ticket.get("project"):
+            return stale(ticket, "project tag changed before %s" % context)
+        project = ptags[0]
+        if wanted_projects and project not in wanted_projects:
+            return stale(ticket, "no longer matches project filter")
+        repo = resolve_repo_path(cfg, project)
+        if repo != group.get("repo"):
+            return stale(ticket, "resolved repo changed before %s" % context)
+
+        column = column_name(cfg, current["column_id"])
+        if column == "Needs human" and ticket.get("column") != "Needs human":
+            return stale(ticket, "moved to Needs human before %s" % context)
+        if wanted_columns and column not in wanted_columns:
+            return stale(ticket, "no longer matches column filter")
+        if not wanted_columns and column == "Done" and not _batch_include_done_column(args):
+            return stale(ticket, "moved to Done before %s" % context)
+        if column == "Needs human" and not _batch_include_needs_human(args):
+            return stale(ticket, "is in Needs human before %s" % context)
+
+        severity = severity_tag(tags)
+        if wanted_severities and severity not in wanted_severities:
+            return stale(ticket, "no longer matches severity filter")
+        if severity == "p3" and not _batch_include_p3(args):
+            return stale(ticket, "became p3 before %s" % context)
+        if wanted_tags and not wanted_tags.issubset(set(tags)):
+            return stale(ticket, "no longer matches tag filter")
+
+        kind = category_name(cfg, current.get("category_id")) or ""
+        if wanted_kinds and kind not in wanted_kinds:
+            return stale(ticket, "no longer matches kind filter")
+
+        item = _batch_ticket_summary(cfg, current, tags, column=column, kind=kind)
+        item["project"] = project
+        item["repo"] = repo
+        refreshed.append(item)
+
+    updated = dict(group)
+    updated["tickets"] = sorted(refreshed, key=_batch_ticket_sort_key)
+    projects = sorted({item["project"] for item in refreshed})
+    updated["projects"] = projects
+    if projects:
+        updated["project"] = projects[0] if len(projects) == 1 else ",".join(projects)
+    updated["session_key"] = os.path.basename(group.get("repo") or "") or updated.get("project") or "ticket"
+    return updated, None
+
+
+def _batch_select_route(args, group, message):
+    requested_provider = getattr(args, "provider", None)
+    contactable_all, refused = _contactable_providers(group["repo"], message, providers=DISPATCH_PROVIDERS)
+    unsafe_refusals = _batch_unsafe_contact_refusals(refused, group["repo"])
+    if unsafe_refusals:
+        return {
+            "status": "blocked",
+            "reason": "unsafe provider refusal",
+            "detail": _batch_refusal_detail(unsafe_refusals),
+            "provider": requested_provider,
+            "session": None,
+            "refused": refused,
+        }
+
+    contactable = [
+        c for c in contactable_all
+        if not requested_provider or c["provider"] == requested_provider
+    ]
+    other_contactable = [
+        c for c in contactable_all
+        if requested_provider and c["provider"] != requested_provider
+    ]
+    if requested_provider and other_contactable:
+        return {
+            "status": "blocked",
+            "reason": "provider conflict",
+            "detail": "existing contactable provider(s) for repo: %s" % ", ".join(c["provider"] for c in other_contactable),
+            "provider": requested_provider,
+            "session": None,
+            "refused": refused,
+            "contactable": contactable_all,
+        }
+    if len(contactable) > 1 and not getattr(args, "provider", None):
+        return {
+            "status": "blocked",
+            "reason": "ambiguous provider",
+            "detail": "contactable providers: %s" % ", ".join(c["provider"] for c in contactable),
+            "refused": refused,
+        }
+    if contactable:
+        selected = contactable[0]
+        if selected["provider"] != "codex":
+            existing_block, _existing = _batch_codex_existing_block(group, refused)
+            if existing_block:
+                return existing_block
+        return {
+            "status": "planned",
+            "mode": "contact",
+            "provider": selected["provider"],
+            "session": selected.get("session") or "(auto-discovered)",
+            "repo": group["repo"],
+            "refused": refused,
+        }
+
+    provider = requested_provider
+    if provider and provider != "codex":
+        return {
+            "status": "blocked",
+            "reason": "no contactable session",
+            "detail": _batch_refusal_detail(refused) or "no contactable session",
+            "refused": refused,
+        }
+
+    existing_block, existing = _batch_codex_existing_block(group, refused)
+    if existing_block:
+        return existing_block
+
+    latest = _agent_tmux(["codex-latest", group["repo"]], timeout=10)
+    if not latest.get("ok") and not _batch_codex_latest_is_absent(latest, group["repo"]):
+        return {
+            "status": "blocked",
+            "reason": "agent-tmux latest lookup failed",
+            "detail": _batch_tmux_failure_detail(latest),
+            "provider": "codex",
+            "session": None,
+            "refused": refused,
+            "latest": latest,
+            "existing": existing,
+        }
+    if latest.get("ok") and not _batch_valid_codex_latest_output(latest):
+        return {
+            "status": "blocked",
+            "reason": "agent-tmux latest lookup failed",
+            "detail": "codex-latest returned malformed success output",
+            "provider": "codex",
+            "session": None,
+            "refused": refused,
+            "latest": latest,
+            "existing": existing,
+        }
+    session = _safe_session_name(getattr(args, "session_prefix", DEFAULT_BATCH_SESSION_PREFIX),
+                                 group.get("session_key") or group["project"])
+    return {
+        "status": "planned",
+        "mode": "resume-latest" if latest.get("ok") else "launch",
+        "provider": "codex",
+        "session": session,
+        "repo": group["repo"],
+        "refused": refused,
+        "latest": latest,
+        "existing": existing,
+    }
+
+
+def _batch_route_group(cfg, args, group):
+    original_group = group
+    group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group)
+    if stale_reason:
+        return {
+            "project": original_group["project"],
+            "repo": original_group["repo"],
+            "tickets": original_group["tickets"],
+            "route": {"status": "blocked", "reason": "stale ticket state", "detail": stale_reason},
+            "status": "blocked",
+            "closeouts": {},
+        }
+    message = _batch_supervision_message(cfg, group, args)
+    route = _batch_select_route(args, group, message)
+    result = {
+        "project": group["project"],
+        "repo": group["repo"],
+        "tickets": group["tickets"],
+        "route": route,
+        "status": "planned" if getattr(args, "dry_run", False) and route.get("status") == "planned" else route.get("status"),
+        "closeouts": {},
+    }
+    if getattr(args, "dry_run", False) or route.get("status") == "blocked":
+        return result
+
+    group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group, context="send/launch")
+    if stale_reason:
+        result["tickets"] = group["tickets"] if group else result["tickets"]
+        result["status"] = "blocked"
+        route["status"] = "blocked"
+        route["reason"] = "stale ticket state"
+        route["detail"] = stale_reason
+        return result
+    message = _batch_supervision_message(cfg, group, args)
+    route = _batch_select_route(args, group, message)
+    result["route"] = route
+    result["tickets"] = group["tickets"]
+    result["project"] = group["project"]
+    if route.get("status") == "blocked":
+        result["status"] = "blocked"
+        return result
+
+    if route["mode"] == "contact":
+        group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group, context="send")
+        if stale_reason:
+            result["tickets"] = group["tickets"] if group else result["tickets"]
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "stale ticket state"
+            route["detail"] = stale_reason
+            return result
+        result["tickets"] = group["tickets"]
+        result["project"] = group["project"]
+        message = _batch_supervision_message(cfg, group, args)
+        session = route.get("session")
+        send = _agent_contact(group["repo"], route["provider"], message, dry_run=False,
+                              session=None if session == "(auto-discovered)" else session)
+        route["send"] = send.get("json") or send.get("raw")
+        if not send.get("ok"):
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "send refused"
+            route["detail"] = _probe_reason(send)
+            return result
+        route["session"] = ((send.get("json") or {}).get("session")) or session or "(auto-discovered)"
+    else:
+        group, stale_reason = _batch_revalidate_group_for_route(cfg, args, group, context="launch")
+        if stale_reason:
+            result["tickets"] = group["tickets"] if group else result["tickets"]
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "stale ticket state"
+            route["detail"] = stale_reason
+            return result
+        result["tickets"] = group["tickets"]
+        result["project"] = group["project"]
+        message = _batch_supervision_message(cfg, group, args)
+        cmd_name = "codex-resume-latest" if route["mode"] == "resume-latest" else "codex"
+        if getattr(args, "full_permission", False):
+            cmd_name += "-full"
+        prelaunch_block, prelaunch_existing = _batch_codex_existing_block(group, route.get("refused") or [])
+        route["prelaunch_existing"] = prelaunch_existing
+        if prelaunch_block:
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "existing session appeared before launch" if prelaunch_existing.get("ok") else prelaunch_block.get("reason")
+            route["detail"] = (
+                "agent-tmux codex-existing reported %s during the final pre-launch guard; refusing to create a duplicate owner lane"
+                % (_first_output_token(prelaunch_existing.get("stdout")) or "an existing session")
+            ) if prelaunch_existing.get("ok") else prelaunch_block.get("detail")
+            route["existing"] = prelaunch_existing
+            return result
+        launch = _agent_tmux([cmd_name, route["session"], group["repo"], message], timeout=60)
+        route["launch"] = launch
+        if not launch.get("ok"):
+            result["status"] = "blocked"
+            route["status"] = "blocked"
+            route["reason"] = "agent-tmux launch failed"
+            route["detail"] = "%s\n%s" % (launch.get("stderr", ""), launch.get("stdout", ""))
+            return result
+
+    route["status"] = "routed"
+    result["status"] = "routed"
+    project_label = _batch_group_project_label(group)
+    for index, ticket in enumerate(group["tickets"], 1):
+        current_ticket = ticket
+        if ticket.get("column") == "New":
+            try:
+                current_group, stale_reason = _batch_revalidate_group_for_route(
+                    cfg, args, {"project": group["project"], "projects": group.get("projects", []),
+                                "repo": group["repo"], "tickets": [ticket]},
+                    context="ticket move")
+                if stale_reason:
+                    result.setdefault("post_route_warnings", []).append(stale_reason)
+                    result["post_route_barrier_failed"] = True
+                    result["ok"] = False
+                    result["status"] = "post_route_blocked"
+                    continue
+                current_ticket = current_group["tickets"][0]
+                if current_ticket.get("column") != "New":
+                    ticket.update(current_ticket)
+                    current_ticket = ticket
+            except SystemExit:
+                sys.stderr.write("agent-ticket: warning: couldn't re-read #%s before batch route audit/move\n" % ticket["id"])
+                result.setdefault("post_route_warnings", []).append(
+                    "#%s could not be re-read before ticket move" % ticket["id"])
+                result["post_route_barrier_failed"] = True
+                result["ok"] = False
+                result["status"] = "post_route_blocked"
+                continue
+        audit_comment(
+            cfg,
+            ticket["id"],
+            "supervise-batch: queued item %d/%d for project:%s (repo group: %s) to %s session %s via %s"
+            % (index, len(group["tickets"]), ticket.get("project") or group["project"], project_label,
+               route["provider"], route["session"], route["mode"]),
+        )
+        if current_ticket.get("column") == "New":
+            try:
+                ticket["column_id"] = move_task_to_column(
+                    cfg, current_ticket, "Triaging",
+                    "move batch-supervised #%s -> Triaging" % ticket["id"])
+                ticket["column"] = "Triaging"
+                ticket["column_id"] = current_ticket["column_id"] = ticket["column_id"]
+            except SystemExit:
+                sys.stderr.write("agent-ticket: warning: couldn't move #%s New->Triaging after batch route\n" % ticket["id"])
+                result.setdefault("post_route_warnings", []).append(
+                    "#%s could not be moved New->Triaging after route" % ticket["id"])
+                result["post_route_barrier_failed"] = True
+                result["ok"] = False
+                result["status"] = "post_route_blocked"
+    return result
+
+
+def _batch_route_groups(cfg, args, groups):
+    results = [None] * len(groups)
+    lock = threading.Lock()
+    repo_lock_fds = {}
+    if not getattr(args, "dry_run", False):
+        try:
+            for repo in sorted({group["repo"] for group in groups}):
+                repo_lock_fds[repo] = _lock_batch_repo(repo)
+        except BaseException:
+            for fd in repo_lock_fds.values():
+                _unlock_batch_repo(fd)
+            raise
+
+    def worker(index, group):
+        try:
+            result = _batch_route_group(cfg, args, group)
+        except (SystemExit, Exception) as e:
+            result = {
+                "project": group["project"],
+                "repo": group["repo"],
+                "tickets": group["tickets"],
+                "route": {"status": "blocked", "reason": "tool error", "detail": str(e)},
+                "status": "blocked",
+                "closeouts": {},
+            }
+        if group["repo"] in repo_lock_fds:
+            result["_repo_lock_fd"] = repo_lock_fds[group["repo"]]
+        with lock:
+            results[index] = result
+
+    threads = [threading.Thread(target=worker, args=(i, group)) for i, group in enumerate(groups)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def _batch_release_route_locks(results):
+    released = set()
+    for result in results:
+        fd = result.pop("_repo_lock_fd", None)
+        if fd is None or fd in released:
+            continue
+        released.add(fd)
+        _unlock_batch_repo(fd)
+
+
+def _batch_group_was_routed(result):
+    return (result.get("route") or {}).get("status") == "routed"
+
+
+def _batch_poll_closeouts(cfg, args, results):
+    ticket_status = {}
+    routed_ticket_ids = {
+        int(ticket["id"])
+        for result in results
+        if _batch_group_was_routed(result)
+        for ticket in result.get("tickets", [])
+    }
+    if not routed_ticket_ids:
+        return ticket_status
+
+    for poll in range(int(args.max_polls) + 1):
+        remaining = set()
+        for result in results:
+            if not _batch_group_was_routed(result):
+                continue
+            for ticket in result.get("tickets", []):
+                tid = int(ticket["id"])
+                if tid in ticket_status and ticket_status[tid].get("status") in ("closed", "needs_human"):
+                    continue
+                current = get_task_in_project(cfg, tid)
+                current_col = column_name(cfg, current["column_id"])
+                if current_col == "Needs human":
+                    ticket_status[tid] = {"status": "needs_human", "column": current_col}
+                    continue
+                if not _task_is_active(current):
+                    closeout = _closeout_report(
+                        cfg,
+                        tid,
+                        require_validation=args.require_validation,
+                        require_commit=args.require_commit,
+                        require_install=args.require_install,
+                        require_clean=args.require_clean,
+                        strict=args.strict_closeout,
+                    )
+                    ticket_status[tid] = {"status": "closed", "column": current_col, "closeout": closeout}
+                    result.setdefault("closeouts", {})[str(tid)] = closeout
+                    continue
+                ticket_status[tid] = {"status": "open", "column": current_col}
+                remaining.add(tid)
+        if not remaining or poll >= int(args.max_polls):
+            break
+        time.sleep(args.poll_interval)
+    return ticket_status
+
+
+def _format_supervise_batch_result(result):
+    lines = [
+        "supervise-batch %s: %s, %d repo group(s), %d ticket(s), %d skipped"
+        % ("dry-run" if result.get("dry_run") else "result",
+           "ok" if result.get("ok") else "blocked",
+           len(result.get("groups", [])), result.get("ticket_count", 0), len(result.get("skipped", [])))
+    ]
+    for group in result.get("groups", []):
+        route = group.get("route") or {}
+        lines.append(
+            "- project:%s -> %s: %d ticket(s), %s %s session %s%s"
+            % (
+                _batch_group_project_label(group),
+                group.get("repo"),
+                len(group.get("tickets", [])),
+                route.get("mode") or route.get("reason") or route.get("status") or group.get("status"),
+                route.get("provider") or "",
+                route.get("session") or "-",
+                (" (%s)" % route.get("detail")) if route.get("status") == "blocked" and route.get("detail") else "",
+            )
+        )
+        if group.get("status") and group.get("status") not in ("planned", route.get("status")):
+            lines.append("  group status: %s" % group.get("status"))
+        for warning in group.get("post_route_warnings") or []:
+            lines.append("  post-route warning: %s" % warning)
+        for ticket in group.get("tickets", []):
+            lines.append("  #%s [%s/%s] %s" % (
+                ticket["id"], ticket.get("severity") or "-", ticket.get("kind") or "-", ticket.get("title") or ""))
+        for tid, state in sorted((group.get("ticket_status") or {}).items(), key=lambda item: int(item[0])):
+            suffix = ""
+            if state.get("closeout"):
+                suffix = " closeout=%s" % ("pass" if state["closeout"].get("ok") else "blocked")
+            lines.append("  status #%s: %s%s" % (tid, state.get("status"), suffix))
+    if result.get("skipped"):
+        lines.append("Skipped:")
+        for skipped in result["skipped"]:
+            suffix = " (blocking)" if skipped.get("blocking") else ""
+            lines.append("  #%s %s%s" % (skipped.get("ticket_id"), skipped.get("reason"), suffix))
+    return "\n".join(lines)
+
+
+def _batch_validate_poll_options(args):
+    if int(getattr(args, "max_polls", 0)) < 0:
+        sys.exit("agent-ticket: supervise-batch --max-polls must be >= 0")
+    if float(getattr(args, "poll_interval", 0)) < 0:
+        sys.exit("agent-ticket: supervise-batch --poll-interval must be >= 0")
+
+
+def cmd_supervise_batch(cfg, args):
+    _batch_validate_poll_options(args)
+    groups, skipped = _batch_collect_ticket_groups(cfg, args)
+    routed = _batch_route_groups(cfg, args, groups)
+    ticket_status = {}
+    try:
+        if not getattr(args, "dry_run", False):
+            ticket_status = _batch_poll_closeouts(cfg, args, routed)
+    finally:
+        _batch_release_route_locks(routed)
+    for group in routed:
+        group_status = {}
+        for ticket in group.get("tickets", []):
+            state = ticket_status.get(int(ticket["id"]))
+            if state:
+                group_status[str(ticket["id"])] = state
+        group["ticket_status"] = group_status
+
+    closeout_blocked = any(
+        state.get("closeout") and not state["closeout"].get("ok")
+        for state in ticket_status.values()
+    )
+    needs_human_blocked = any(state.get("status") == "needs_human" for state in ticket_status.values())
+    open_after_poll_blocked = any(state.get("status") == "open" for state in ticket_status.values())
+    route_blocked = any(group.get("status") == "blocked" for group in routed)
+    post_route_blocked = any(group.get("post_route_barrier_failed") for group in routed)
+    skip_blocked = bool(_batch_blocking_skips(skipped))
+    result = {
+        "ok": not (route_blocked or closeout_blocked or needs_human_blocked or open_after_poll_blocked or post_route_blocked or skip_blocked),
+        "dry_run": bool(getattr(args, "dry_run", False)),
+        "groups": routed,
+        "skipped": skipped,
+        "ticket_count": sum(len(group.get("tickets", [])) for group in routed),
+    }
+    out(args, result, _format_supervise_batch_result(result))
+
+
+def _create_supervision_blocker(cfg, original_id, title, body):
+    tags = ["project:agent-tickets", "agent:codex", "p2", "source:supervise"]
+    ticket_title = "agent-ticket supervise blocked for #%s: %s" % (original_id, title[:80])
+    for t in _all_tasks(cfg, include_closed=False):
+        try:
+            if "project:agent-tickets" in task_tags(cfg, t["id"]) and _is_strong_dup(ticket_title, t.get("title", "")):
+                audit_comment(cfg, t["id"], body)
+                return int(t["id"])
+        except SystemExit:
+            pass
+    params = {
+        "title": ticket_title,
+        "project_id": cfg["project_id"],
+        "column_id": resolve_column_id(cfg, "Needs human"),
+        "description": body,
+        "tags": tags,
+    }
+    cid = resolve_category_id(cfg, "blocker")
+    if cid:
+        params["category_id"] = cid
+    created = rpc(cfg, "createTask", params)
+    return int(created) if created else None
+
+
+def _supervision_blocked(cfg, args, reason, detail, original_id=None):
+    body = "supervise blocked: %s\n\n%s" % (reason, detail or "")
+    blocker_id = None
+    if not getattr(args, "dry_run", False) and not getattr(args, "no_tool_ticket", False):
+        blocker_id = _create_supervision_blocker(cfg, original_id or args.id, reason, body)
+        audit_comment(cfg, original_id or args.id, "supervise blocked: %s%s" % (
+            reason, ("\nFiled tooling/blocker ticket #%s." % blocker_id) if blocker_id else ""))
+    return {"ok": False, "status": "blocked", "reason": reason, "detail": detail, "tool_ticket": blocker_id}
+
+
+def _contactable_providers(repo, message, session=None, providers=None):
+    providers = providers or DISPATCH_PROVIDERS
+    contactable, refused = [], []
+    for provider in providers:
+        result = _agent_contact(repo, provider, message, dry_run=True, session=session)
+        kind, info = _classify_probe(result)
+        if kind == "ok":
+            contactable.append({"provider": provider, "session": info, "probe": result})
+        else:
+            refused.append({"provider": provider, "reason": info, "probe": result})
+    return contactable, refused
+
+
+def cmd_supervise(cfg, args):
+    t = get_task_in_project(cfg, args.id)
+    tags = task_tags(cfg, args.id)
+    col = column_name(cfg, t["column_id"])
+    title = _san(t.get("title", ""))
+    pname, repo = _resolve_ticket_repo(cfg, tags)
+    if not pname or not repo:
+        result = _supervision_blocked(cfg, args, "unresolved repo",
+                                      "ticket has project tag %r; repo_roots=%s" % (pname, cfg.get("repo_roots")),
+                                      args.id)
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+    if col == "Needs human":
+        result = _supervision_blocked(cfg, args, "needs human",
+                                      "ticket is in Needs human; supervisor should not auto-route it", args.id)
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+
+    message = _supervision_message(cfg, args.id, pname, title, args)
+    providers = [args.provider] if args.provider else DISPATCH_PROVIDERS
+    contactable, refused = _contactable_providers(repo, message, session=args.session, providers=providers)
+    selected = None
+    route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
+
+    if len(contactable) > 1 and not args.provider:
+        result = _supervision_blocked(cfg, args, "ambiguous provider",
+                                      "contactable providers: %s" % ", ".join(c["provider"] for c in contactable),
+                                      args.id)
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+    if contactable:
+        selected = {**contactable[0], "mode": "contact"}
+    else:
+        provider = args.provider
+        latest = None
+        existing = None
+        if provider in (None, "codex"):
+            latest = _agent_tmux(["codex-latest", repo], timeout=10)
+            existing = _agent_tmux(["codex-existing", repo], timeout=10)
+            if provider is None and (latest.get("ok") or existing.get("ok")):
+                provider = "codex"
+        if provider != "codex":
+            result = _supervision_blocked(
+                cfg, args, "no contactable session",
+                "; ".join("%s: %s" % (r["provider"], r["reason"]) for r in refused) or "no contactable session",
+                args.id,
+            )
+            out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+            return
+        session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
+        selected = {
+            "provider": "codex",
+            "session": session,
+            "mode": "resume-latest" if latest and latest.get("ok") else "launch",
+            "latest": latest,
+            "existing": existing,
+        }
+
+    route["provider"] = selected["provider"]
+    route["session"] = selected.get("session") or args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
+    route["mode"] = selected["mode"]
+    route["full_permission"] = bool(args.full_permission)
+    watcher_preview = None
+    if getattr(args, "watch_origin", False):
+        watcher_preview = _origin_watcher_record(args.id, args, "supervise")
+    if args.dry_run:
+        result = {"ok": True, "dry_run": True, "route": route, "refused": refused}
+        if watcher_preview:
+            result["watcher"] = watcher_preview
+        out(args, result,
+            "supervise #%s dry-run: %s %s session %s for %s" % (
+                args.id, route["mode"], route["provider"], route["session"], repo))
+        return
+    watcher = _register_origin_watcher(cfg, args.id, args, "supervise")
+    if watcher:
+        route["watcher"] = watcher
+
+    if selected["mode"] == "contact":
+        send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=selected.get("session"))
+        if not send.get("ok"):
+            result = _supervision_blocked(cfg, args, "send refused", _probe_reason(send), args.id)
+            out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+            return
+        route["sent"] = send.get("json") or send.get("raw")
+    else:
+        cmd = ["codex-resume-latest" if selected["mode"] == "resume-latest" else "codex", route["session"], repo]
+        if args.full_permission:
+            cmd += ["-s", "danger-full-access", "-a", "never"]
+        cmd.append(message)
+        launch = _agent_tmux(cmd, timeout=60)
+        route["launch"] = launch
+        if not launch.get("ok"):
+            result = _supervision_blocked(cfg, args, "agent-tmux launch failed",
+                                          "%s\n%s" % (launch.get("stderr", ""), launch.get("stdout", "")), args.id)
+            out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+            return
+
+    audit_comment(cfg, args.id, "supervise: routed to %s session %s via %s" % (
+        route["provider"], route["session"], route["mode"]))
+    if col == "New":
+        try:
+            move_task_to_column(cfg, t, "Triaging", "move supervised #%s -> Triaging" % args.id)
+        except SystemExit:
+            sys.stderr.write("agent-ticket: warning: couldn't move #%s New->Triaging after supervise route\n" % args.id)
+
+    final_report = None
+    for poll in range(args.max_polls + 1):
+        current = get_task_in_project(cfg, args.id)
+        current_col = column_name(cfg, current["column_id"])
+        if current_col == "Needs human":
+            result = {"ok": False, "status": "blocked", "reason": "ticket moved to Needs human", "route": route}
+            out(args, result, "supervise #%s blocked: ticket moved to Needs human" % args.id)
+            return
+        if not _task_is_active(current):
+            final_report = _closeout_report(
+                cfg,
+                args.id,
+                require_validation=args.require_validation,
+                require_commit=args.require_commit,
+                require_install=args.require_install,
+                require_clean=args.require_clean,
+                strict=args.strict_closeout,
+            )
+            result = {"ok": final_report["ok"], "status": "closed", "route": route, "closeout": final_report}
+            out(args, result, "supervise #%s closed: %s" % (args.id, "closeout pass" if final_report["ok"] else "closeout blocked"))
+            return
+        if poll >= args.max_polls:
+            break
+        time.sleep(args.poll_interval)
+
+    result = {"ok": True, "status": "routed", "route": route,
+              "detail": "owner was routed; ticket still open after polling limit"}
+    out(args, result, "supervise #%s routed to %s session %s; ticket still open after polling limit" % (
+        args.id, route["provider"], route["session"]))
+
+
+def _display_path(path):
+    if not path:
+        return "-"
+    home = os.path.expanduser("~")
+    try:
+        real = os.path.realpath(path)
+        if real == home:
+            return "~"
+        if real.startswith(home + os.sep):
+            return "~/" + real[len(home) + 1:]
+    except OSError:
+        pass
+    return path
+
+
+def _yes_no_unknown(value):
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def cmd_source_info(cfg, args):
+    info = _source_info()
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return
+
+    print("agent-ticket source info")
+    print("  installed CLI:        %s" % _display_path(info["installed_cli"]))
+    print("  install mode:         %s" % info["install_mode"])
+    print("  runtime uses source:  %s" % _yes_no_unknown(info["runtime_uses_source_tree"]))
+    print("  source manifest:      %s (%s)" % (
+        _display_path(info["source_manifest"]),
+        "loaded" if info["source_manifest_loaded"] else info["source_manifest_error"],
+    ))
+    print("  source dir:           %s%s" % (
+        _display_path(info["source_dir"]),
+        "" if info["source_dir_exists"] else " (missing)",
+    ))
+    print("  source CLI:           %s%s" % (
+        _display_path(info["source_cli"]),
+        "" if info["source_cli_exists"] else " (missing)",
+    ))
+    print("  installed == source:  %s" % _yes_no_unknown(info["installed_cli_matches_source"]))
+    print("  codex skill == source:%s" % ("  " + _yes_no_unknown(info["installed_codex_skill_matches_source"])))
+    print("  claude skill == source:%s" % (" " + _yes_no_unknown(info["installed_claude_skill_matches_source"])))
+    print("  notify hook == source:%s" % (" " + _yes_no_unknown(info["installed_notify_hook_matches_source"])))
+    if info.get("rollout_command"):
+        print("  rollout command:      %s" % info["rollout_command"])
+
+    git = info.get("git") or {}
+    if git.get("available"):
+        print("  git:                  available")
+        if git.get("toplevel"):
+            print("    toplevel:           %s" % _display_path(git["toplevel"]))
+        if git.get("branch"):
+            print("    branch:             %s" % git["branch"])
+        if git.get("head"):
+            print("    head:               %s" % git["head"])
+        lines = git.get("status_short_branch") or []
+        if lines:
+            print("    status:")
+            for line in lines:
+                print("      %s" % _san(line))
+    else:
+        print("  git:                  unavailable")
+        meta = git.get("metadata") or {}
+        if meta:
+            print("    metadata:           %s (%s)" % (_display_path(meta.get("path")), meta.get("state", "unknown")))
+        if git.get("error"):
+            print("    error:              %s" % _san(git["error"]))
+
+
+def cmd_tag(cfg, args):
+    get_task_in_project(cfg, args.id)
+    tags = set(task_tags(cfg, args.id))
+    tags |= set(args.add or [])
+    tags -= set(args.remove or [])
+    _ok(rpc(cfg, "setTaskTags", {"project_id": cfg["project_id"], "task_id": args.id, "tags": sorted(tags)}),
+        "set tags on #%s" % args.id)
+    out(args, {"tags": sorted(tags)}, "#%s tags: %s" % (args.id, ", ".join(_san(x) for x in sorted(tags)) or "-"))
+
+
+def _dispatch_message(cfg, task_id, pname, title):
+    return _san(
+        "Ticket #%d filed against this repo (project %s): %s\n%s\n"
+        "Please triage it: move it to 'Agent working' if you're taking it, fix from SOURCE "
+        "(not the installed copy), validate, comment evidence on the ticket, then `agent-ticket close %d`.\n\n"
+        "Closeout gate: before closing, comment validation commands/results, clean worktree or commit evidence "
+        "when source changed, and install/sync evidence when installed artifacts changed."
+        % (int(task_id), pname, title or "(no title)", web_url(cfg, "task/%d" % int(task_id)), int(task_id))
+    )
+
+
+def cmd_dispatch(cfg, args, return_dict=False):
+    """Best-effort: ping the owner agent for a ticket's project repo. Always
+    explicit (never called automatically by `new` unless --dispatch). Refuses
+    Needs-human; skips p3; won't re-dispatch a ticket already in Agent
+    working/Done/already-dispatched; degrades to an audit comment + exit 0 when
+    there's no contactable session / multiple providers / no trusted-roots /
+    no resolvable repo. Never tells the woken worker to run `dispatch` itself.
+
+    With return_dict=True (used by `new --dispatch` in --json mode so the caller
+    can emit ONE combined JSON object) it returns the result dict and prints
+    nothing; otherwise it prints via out()."""
+    def _done(obj, human):
+        if getattr(args, "dry_run", False) and "dry_run" not in obj:
+            obj = {**obj, "dry_run": True}
+        if not return_dict:
+            out(args, obj, human)
+        return obj
+
+    t = get_task_in_project(cfg, args.id)
+    tags = task_tags(cfg, args.id)
+    col = column_name(cfg, t["column_id"])
+    title = _san(t.get("title", ""))
+
+    # --- gates -------------------------------------------------------------
+    if col == "Needs human":
+        if return_dict:
+            return {"dispatched": False, "reason": "needs human (a person should route it)"}
+        sys.exit("agent-ticket: #%s is in 'Needs human' — refusing to dispatch; a person should route it." % args.id)
+    if (not t.get("is_active")) or col in ("Agent working", "Done"):
+        return _done({"dispatched": False, "reason": "already in %s" % col},
+                     "#%s is already in '%s' — not re-dispatching." % (args.id, col))
+    comments = rpc(cfg, "getAllComments", {"task_id": args.id}) or []
+    if any((c.get("comment") or "").startswith(_DISPATCH_COMMENT_PREFIX) for c in comments):
+        return _done({"dispatched": False, "reason": "already dispatched"},
+                     "#%s was already dispatched (see comments) — not re-dispatching." % args.id)
+    if getattr(args, "severity", None) == "p3" or "p3" in tags:
+        m = "dispatch skipped: p3 is low priority and should not interrupt an owner agent by default."
+        if not getattr(args, "dry_run", False) and not any((c.get("comment") or "").startswith(_DISPATCH_P3_SKIP_PREFIX) for c in comments):
+            audit_comment(cfg, args.id, m)
+        return _done(
+            {"dispatched": False, "reason": "p3 does not dispatch by default", "dry_run": bool(getattr(args, "dry_run", False))},
+            "#%s: %s" % (args.id, m),
+        )
+
+    # --- resolve project / repo -------------------------------------------
+    pname = project_tag(tags)
+    if not pname:
+        m = "dispatch: ticket has no project:<name> tag — can't resolve a repo to route it to."
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "no project tag"}, "#%s: %s" % (args.id, m))
+    repo = resolve_repo_path(cfg, pname)
+    if not repo:
+        m = ("dispatch: can't resolve a repo path for project:%s (looked under: %s). Use the exact repo "
+             "directory name, or add a 'repo_roots' entry to %s." % (pname, ", ".join(cfg["repo_roots"]), CONFIG_PATH))
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "unresolved repo"}, "#%s: %s" % (args.id, m))
+
+    # --- trusted-roots gate (agent-contact needs BOTH of these set) --------
+    if not (os.environ.get("AGENT_CONTACT_TRUSTED_PROVIDER_ROOTS") and os.environ.get("AGENT_CONTACT_TRUSTED_LAUNCHER_ROOTS")):
+        m = ("dispatch unavailable: AGENT_CONTACT_TRUSTED_PROVIDER_ROOTS and AGENT_CONTACT_TRUSTED_LAUNCHER_ROOTS "
+             "must both be set in this environment. Run `agent-contact trust-roots --repo %s --provider codex` (and "
+             "`--provider claude`), export the printed vars, then retry. Ticket left in '%s'." % (repo, col))
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "no trusted roots"}, "#%s: %s" % (args.id, m))
+
+    # --- probe both providers ---------------------------------------------
+    message = _dispatch_message(cfg, args.id, pname, title)
+    contactable, not_reasons = [], []
+    for prov in DISPATCH_PROVIDERS:
+        kind, info = _classify_probe(_agent_contact(repo, prov, message, dry_run=True))
+        (contactable.append((prov, info)) if kind == "ok" else not_reasons.append("%s: %s" % (prov, info)))
+    if not contactable:
+        m = ("dispatch: no contactable owner agent for project:%s — %s. Ticket left in '%s' (the notify hook will "
+             "surface it)." % (pname, "; ".join(not_reasons) or "no sessions", col))
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "no contactable session", "detail": not_reasons},
+                     "#%s: %s" % (args.id, m))
+    if len(contactable) > 1:
+        provs = ", ".join(p for p, _ in contactable)
+        m = ("dispatch: owner sessions exist for multiple providers (%s) — not auto-routing; a human should pick. "
+             "Ticket left in '%s'." % (provs, col))
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "ambiguous provider", "providers": [p for p, _ in contactable]},
+                     "#%s: %s" % (args.id, m))
+    provider, session = contactable[0]
+
+    if getattr(args, "dry_run", False):
+        return _done(
+            {
+                "dispatched": False,
+                "dry_run": True,
+                "would_dispatch": True,
+                "provider": provider,
+                "session": session or "(auto-discovered)",
+                "reason": "dry-run",
+            },
+            "#%s: dry-run would dispatch to %s session %s." % (
+                args.id,
+                provider,
+                session or "(auto-discovered)",
+            ),
+        )
+
+    # --- send for real -----------------------------------------------------
+    res = _agent_contact(repo, provider, message, dry_run=False, session=session)
+    if not res.get("ok"):
+        m = ("dispatch: agent-contact refused the send to %s%s — %s. Ticket left in '%s'."
+             % (provider, (" session %s" % session) if session else "", _probe_reason(res), col))
+        if not getattr(args, "dry_run", False):
+            audit_comment(cfg, args.id, m)
+        return _done({"dispatched": False, "reason": "send refused", "detail": _probe_reason(res)},
+                     "#%s: %s" % (args.id, m))
+
+    # --- success -----------------------------------------------------------
+    sent_session = ((res.get("json") or {}).get("session")) or session or "(auto-discovered)"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+    # record the marker FIRST (so the already-dispatched guard survives even if the move below fails)
+    audit_comment(cfg, args.id, "%s%s session %s at %s" % (_DISPATCH_COMMENT_PREFIX, provider, sent_session, stamp))
+    if col == "New":
+        try:
+            r = rpc(cfg, "moveTaskPosition", {"project_id": cfg["project_id"], "task_id": args.id,
+                                              "column_id": resolve_column_id(cfg, "Triaging"), "position": 1,
+                                              "swimlane_id": int(t.get("swimlane_id") or 1)})
+            if r is False or r is None:
+                sys.stderr.write("agent-ticket: warning: couldn't move #%s New->Triaging (dispatch still succeeded)\n" % args.id)
+        except SystemExit:
+            sys.stderr.write("agent-ticket: warning: couldn't move #%s New->Triaging (dispatch still succeeded)\n" % args.id)
+    return _done({"dispatched": True, "provider": provider, "session": sent_session, "at": stamp},
+                 "Dispatched #%s to %s session %s." % (args.id, provider, sent_session))
+
+
+def _add_watch_origin_args(sp):
+    sp.add_argument("--watch-origin", action="store_true",
+                    help="register this caller as the one supervised ticket.closed callback target")
+    sp.add_argument("--origin-repo",
+                    help="repo path for the callback recipient (default: git toplevel or cwd)")
+    sp.add_argument("--origin-provider", choices=DISPATCH_PROVIDERS,
+                    help="callback recipient provider; may also use AGENT_TICKETS_ORIGIN_PROVIDER")
+    sp.add_argument("--origin-session",
+                    help="specific tmux-managed recipient session; omitted means agent-contact must auto-discover one")
+    sp.add_argument("--watch-expires-hours", type=float, default=DEFAULT_WATCH_EXPIRES_HOURS,
+                    help="hours before the callback watcher becomes unsafe to deliver")
+    sp.add_argument("--callback-reason", default="watched ticket closed",
+                    help="short reason stored with the watcher metadata")
+    sp.add_argument("--correlation-id",
+                    help="caller-supplied async request/reply correlation id")
+
+
+def main():
+    # --json works before OR after the subcommand. default=SUPPRESS so the
+    # subparser copy doesn't clobber a value set by the top-level parser.
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="raw JSON output")
+
+    p = argparse.ArgumentParser(prog="agent-ticket", parents=[base],
+                                description="File/query tickets in the local Kanboard 'Agent Tickets' board "
+                                            "(issues hit while USING the user's apps/tools — not a dev backlog).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("new", parents=[base], help="file a new ticket")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--body", default="", help="description (markdown ok; \\n and \\t are expanded)")
+    sp.add_argument("--kind", choices=KIND_CHOICES, help="bug/friction/request/blocker/question/idea/regression")
+    sp.add_argument("--severity", choices=SEVERITY_CHOICES, help="p1 (urgent) .. p3 (low)")
+    sp.add_argument("--project", help="which app/tool/codebase this is about, e.g. sortie2")
+    sp.add_argument("--agent", help="name of the agent filing this, e.g. claude, codex")
+    sp.add_argument("--column", default="New", choices=COLUMN_CHOICES)
+    sp.add_argument("--tag", action="append", help="extra tag (repeatable)")
+    sp.add_argument("--force", action="store_true", help="create even if a possible duplicate ticket exists")
+    sp.add_argument("--dispatch", action="store_true",
+                    help="after creating, try to ping the owner agent for --project's repo (best-effort)")
+    _add_watch_origin_args(sp)
+    sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("list", parents=[base], help="list tickets")
+    sp.add_argument("--all", action="store_true", help="include closed tickets (default: open only)")
+    sp.add_argument("--column", choices=COLUMN_CHOICES)
+    sp.add_argument("--kind", choices=KIND_CHOICES)
+    sp.add_argument("--project", help="filter to tickets tagged project:<name>")
+    sp.add_argument("--agent", help="filter to tickets tagged agent:<name>")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("show", parents=[base], help="show a ticket with tags + comments")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("comment", parents=[base], help="add a comment")
+    sp.add_argument("id", type=int)
+    sp.add_argument("text")
+    sp.set_defaults(func=cmd_comment)
+
+    sp = sub.add_parser("move", parents=[base], help="move a ticket to a column")
+    sp.add_argument("id", type=int)
+    sp.add_argument("column", choices=COLUMN_CHOICES)
+    sp.set_defaults(func=cmd_move)
+
+    sp = sub.add_parser("close", parents=[base], help="close a ticket")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_close)
+
+    sp = sub.add_parser("reopen", parents=[base], help="reopen a ticket")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--column", default="Triaging", choices=COLUMN_CHOICES,
+                    help="live column to move the reopened ticket to (default: Triaging)")
+    sp.set_defaults(func=cmd_reopen)
+
+    sp = sub.add_parser("closeout-check", parents=[base],
+                        help="independently check ticket closeout evidence before accepting owner-agent completion")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--strict", action="store_true",
+                    help="require ticket closed and validation evidence; dirty git worktrees always block")
+    sp.add_argument("--require-clean", action="store_true", help="fail if the owning repo worktree cannot be proven clean")
+    sp.add_argument("--require-validation", action="store_true", help="fail when ticket comments lack validation evidence")
+    sp.add_argument("--require-commit", action="store_true", help="fail when neither comments nor git HEAD provide a commit id")
+    sp.add_argument("--require-install", action="store_true", help="fail when ticket comments lack install/sync evidence")
+    sp.add_argument("--comment", action="store_true", help="append the check report as a ticket comment")
+    sp.add_argument("--fail", action="store_true", help="exit non-zero when required closeout checks fail")
+    sp.set_defaults(func=cmd_closeout_check)
+
+    sp = sub.add_parser("callbacks", parents=[base],
+                        help="show durable watched-ticket callback outbox records")
+    sp.add_argument("action", nargs="?", default="list", choices=["list", "ack", "retry"],
+                    help="list callbacks, acknowledge a handled pending callback, or retry delivery")
+    sp.add_argument("event_key", nargs="?", help="callback event key for ack/retry, e.g. ticket:42:closed:1")
+    sp.add_argument("--pending", action="store_true", help="only show pending callbacks that still need retry or ack")
+    sp.add_argument("--repo", help="filter by callback origin repo path or repo basename")
+    sp.set_defaults(func=cmd_callbacks, needs_config=False)
+
+    sp = sub.add_parser("tag", parents=[base], help="add/remove tags on a ticket")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--add", action="append")
+    sp.add_argument("--remove", action="append")
+    sp.set_defaults(func=cmd_tag)
+
+    sub.add_parser("columns", parents=[base], help="list board columns").set_defaults(func=cmd_columns)
+
+    sub.add_parser("source-info", parents=[base],
+                   help="show installed CLI source ownership, rollout path, and source git status").set_defaults(
+                       func=cmd_source_info, needs_config=False)
+
+    sp = sub.add_parser("dispatch", parents=[base],
+                        help="best-effort: ping the owner agent for a ticket's project repo (explicit, guarded)")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--severity", choices=SEVERITY_CHOICES,
+                    help="hint for the p3 skip gate if the ticket itself isn't tagged p1/p2/p3")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="resolve/probe routing without comments, moves, or real agent contact")
+    sp.set_defaults(func=cmd_dispatch)
+
+    sp = sub.add_parser("supervise", parents=[base],
+                        help="route an owner-agent ticket through agent-contact/agent-tmux and monitor closeout")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--provider", choices=DISPATCH_PROVIDERS,
+                    help="owner provider lane; auto-detects contactable sessions or Codex latest-chat lane when omitted")
+    sp.add_argument("--session", help="specific tmux session to validate/use")
+    sp.add_argument("--session-prefix", default="owner", help="prefix for deterministic ticket-scoped launched/resumed owner sessions")
+    sp.add_argument("--full-permission", action="store_true",
+                    help="make Codex launch/resume use visible -s danger-full-access -a never profile")
+    sp.add_argument("--message", default="", help="extra supervisor note appended to the owner prompt")
+    sp.add_argument("--dry-run", action="store_true", help="resolve and print the route without writes/contact/launch")
+    sp.add_argument("--no-tool-ticket", action="store_true",
+                    help="do not file an agent-tickets blocker when supervision tooling refuses")
+    sp.add_argument("--poll-interval", type=float, default=DEFAULT_SUPERVISE_POLL_INTERVAL)
+    sp.add_argument("--max-polls", type=int, default=DEFAULT_SUPERVISE_MAX_POLLS,
+                    help="number of polls after routing; use 0 to route once and return")
+    sp.add_argument("--strict-closeout", action="store_true",
+                    help="when ticket closes, require closeout-check strict evidence before reporting success")
+    sp.add_argument("--require-clean", action="store_true", help="closeout-check flag: require provably clean worktree")
+    sp.add_argument("--require-validation", action="store_true",
+                    help="closeout-check flag: require validation evidence")
+    sp.add_argument("--require-commit", action="store_true", help="closeout-check flag: require commit id")
+    sp.add_argument("--require-install", action="store_true", help="closeout-check flag: require install/sync evidence")
+    _add_watch_origin_args(sp)
+    sp.set_defaults(func=cmd_supervise)
+
+    sp = sub.add_parser("supervise-batch", parents=[base],
+                        help="group open tickets by project repo and guarded-route one owner worker per repo")
+    sp.add_argument("--project", action="append", help="only include tickets tagged project:<name> (repeatable)")
+    sp.add_argument("--severity", choices=SEVERITY_CHOICES, action="append",
+                    help="only include tickets with this severity tag (repeatable)")
+    sp.add_argument("--kind", choices=KIND_CHOICES, action="append",
+                    help="only include tickets with this category/kind (repeatable)")
+    sp.add_argument("--tag", action="append", help="only include tickets carrying this tag; repeat for all-required tags")
+    sp.add_argument("--column", choices=COLUMN_CHOICES, action="append",
+                    help="only include tickets in this column (repeatable)")
+    sp.add_argument("--include-p3", action="store_true", help="include p3 tickets; otherwise they are skipped by default")
+    sp.add_argument("--include-needs-human", action="store_true",
+                    help="include Needs human tickets; otherwise they are skipped by default")
+    sp.add_argument("--provider", choices=DISPATCH_PROVIDERS,
+                    help="preferred owner provider lane; all providers are still probed for unsafe existing lanes")
+    sp.add_argument("--session-prefix", default=DEFAULT_BATCH_SESSION_PREFIX,
+                    help="prefix for deterministic launched/resumed Codex batch sessions")
+    sp.add_argument("--full-permission", action="store_true",
+                    help="launch/resume Codex workers through agent-tmux full-permission aliases")
+    sp.add_argument("--message", default="", help="extra supervisor note appended to every repo queue prompt")
+    sp.add_argument("--dry-run", action="store_true", help="show grouping and route plan without ticket writes, sends, or launches")
+    sp.add_argument("--poll-interval", type=float, default=DEFAULT_SUPERVISE_POLL_INTERVAL)
+    sp.add_argument("--max-polls", type=int, default=DEFAULT_SUPERVISE_MAX_POLLS,
+                    help="number of polls after routing; use 0 to route once and return")
+    sp.add_argument("--strict-closeout", action="store_true",
+                    help="when tickets close, require closeout-check strict evidence before reporting success")
+    sp.add_argument("--require-clean", action="store_true", help="closeout-check flag: require provably clean worktree")
+    sp.add_argument("--require-validation", action="store_true",
+                    help="closeout-check flag: require validation evidence")
+    sp.add_argument("--require-commit", action="store_true", help="closeout-check flag: require commit id")
+    sp.add_argument("--require-install", action="store_true", help="closeout-check flag: require install/sync evidence")
+    sp.set_defaults(func=cmd_supervise_batch)
+
+    args = p.parse_args()
+    args.json = getattr(args, "json", False)
+    cfg = load_config() if getattr(args, "needs_config", True) else None
+    args.func(cfg, args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# If this directory is ever put under git, never commit live data or secrets.
+data/
+backups/
+config.json
+*.sqlite
+SESSION-*.jsonl
+.rewind/
+
+# generated / local cruft
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/

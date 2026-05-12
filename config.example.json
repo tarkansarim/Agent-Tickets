@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to ~/.config/agent-tickets/config.json (chmod 600) and fill in 'token'. Do NOT keep the real token in this Dropbox-synced folder. 'token' must be the APPLICATION API token: in Kanboard go to Settings -> API -> 'API token' (the token shown there for the built-in 'jsonrpc' user) — a personal access token won't work, the CLI always authenticates as jsonrpc:<token>. You can also pass it via AGENT_TICKETS_TOKEN. bootstrap-board.py adds 'project_id' once it has resolved/created the Agent Tickets project — do not set it here. comment_user_id is the Kanboard user id used when the CLI posts a comment (1 = the default admin user); change it if comments should be attributed to a different user. repo_roots: directories searched for a <project> subdir when `agent-ticket dispatch` resolves a ticket's project:<name> tag to a source repo path; first hit wins; '~' is expanded.",
+  "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+  "token": "PUT-YOUR-KANBOARD-API-TOKEN-HERE",
+  "comment_user_id": 1,
+  "repo_roots": ["~/Dropbox/work/MyTools"]
+}

@@ -1,0 +1,18 @@
+# Kanboard — local agent ticketing board.
+# Data lives OUTSIDE this directory on purpose: this folder is in Dropbox, and a
+# live SQLite DB + Dropbox sync = corruption risk. Override KANBOARD_DATA_DIR if you
+# want it elsewhere (must be a local, non-cloud-synced path).
+#
+#   cd agent-tickets && docker compose up -d
+#
+services:
+  kanboard:
+    image: kanboard/kanboard:v1.2.52   # pinned for reproducibility; bump deliberately
+    container_name: kanboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:80"          # bound to localhost only
+    volumes:
+      - "${KANBOARD_DATA_DIR:-${HOME}/kanboard-data}/data:/var/www/app/data"
+      - "${KANBOARD_DATA_DIR:-${HOME}/kanboard-data}/plugins:/var/www/app/plugins"
+      - "${KANBOARD_DATA_DIR:-${HOME}/kanboard-data}/ssl:/etc/nginx/ssl"
