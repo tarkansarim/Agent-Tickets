@@ -63,7 +63,7 @@ The skill works for **both Claude Code and Codex** — `install.sh` copies `skil
 So agents don't have to *remember* to look, `install.sh` also registers a **notify hook** (`scripts/notify-hook.sh`, installed to `~/.config/agent-tickets/`) that surfaces open tickets for the repo the agent is working in:
 
 - **Claude Code** — `SessionStart` (lists what's open now) + `UserPromptSubmit` (shows any ticket that appeared since, once).
-- **Codex** — `SessionStart` + `Stop` (Codex has no per-prompt event; `Stop` fires after each turn). *Codex validates hooks by hash, so the first `codex` run after install will ask you to trust the new hook — approve it.*
+- **Codex** — `SessionStart` prints the baseline list. `Stop` runs a Codex-specific silent cache refresh (`codex-stop-changes`) so Stop stdout stays empty and satisfies Codex's hook JSON contract. *Codex validates hooks by hash, so the first `codex` run after install will ask you to trust the new hook — approve it.*
 
 The hook derives the repo name from the git toplevel (matching the `project:<name>` tag convention), prints `🎫 Open/New agent-ticket(s) for <repo>: …`, and also surfaces pending watched-ticket callbacks from the local outbox. It is **silent** when there's nothing new, Kanboard is down, or the CLI isn't installed (it never blocks the agent). "Already surfaced" state is per-repo in `~/.cache/agent-tickets/`, so persistently-open tickets don't re-nag.
 

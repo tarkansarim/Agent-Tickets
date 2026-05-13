@@ -4,13 +4,19 @@
 # by install.sh. Surfaces open agent-tickets for the repo the agent is working in:
 #
 #   notify-hook.sh baseline   # print ALL currently-open tickets for this repo, seed the seen-cache
-#   notify-hook.sh changes    # print only tickets that appeared since the last check (then update cache)
+#   notify-hook.sh changes              # print only tickets that appeared since the last check (then update cache)
+#   notify-hook.sh codex-stop-changes   # update the seen-cache, but keep stdout empty for Codex Stop JSON contract
 #
 # Repo is identified by the git toplevel's directory name (matching the `project:<name>`
 # tag convention). Silent — prints nothing — when there's nothing new, when Kanboard is
 # down, or when the CLI isn't installed. Never blocks the agent; always exits 0.
 set -u
 MODE="${1:-changes}"
+OUTPUT_MODE="text"
+if [ "$MODE" = "codex-stop-changes" ]; then
+  MODE="changes"
+  OUTPUT_MODE="codex-stop"
+fi
 
 CLI="$HOME/.local/bin/agent-ticket"
 if ! [ -x "$CLI" ]; then
@@ -31,7 +37,11 @@ SEEN="$CACHE_DIR/seen-$SAFE_REPO.json"
 JSON="$("$CLI" list --project "$REPO" --json 2>/dev/null)" || JSON=""
 
 if [ -n "$JSON" ]; then
-AGENT_TICKETS_JSON="$JSON" AT_MODE="$MODE" AT_REPO="$REPO" AT_SEEN="$SEEN" python3 <<'PY' || true
+PY_STDOUT="/dev/stdout"
+if [ "$OUTPUT_MODE" = "codex-stop" ]; then
+  PY_STDOUT="/dev/null"
+fi
+AGENT_TICKETS_JSON="$JSON" AT_MODE="$MODE" AT_REPO="$REPO" AT_SEEN="$SEEN" python3 <<'PY' >"$PY_STDOUT" || true
 import json, os, sys
 mode = os.environ.get("AT_MODE", "changes")
 repo = os.environ.get("AT_REPO", "")
@@ -78,5 +88,7 @@ print("  (`agent-ticket show <id>` for details; if you OWN this repo, fix in pla
 PY
 fi
 
-"$CLI" callbacks --pending --repo "$REPO" 2>/dev/null || true
+if [ "$OUTPUT_MODE" != "codex-stop" ]; then
+  "$CLI" callbacks --pending --repo "$REPO" 2>/dev/null || true
+fi
 exit 0

@@ -1976,6 +1976,53 @@ def _comments_text(comments):
     return "\n".join(str(c.get("comment") or "") for c in comments)
 
 
+def _comment_order_key(comment):
+    def as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return (as_int(comment.get("date_creation")), as_int(comment.get("id")))
+
+
+def _latest_comment_regex_evidence(comments, regex):
+    for comment in sorted(comments or [], key=_comment_order_key, reverse=True):
+        text = str(comment.get("comment") or "")
+        matches = list(regex.finditer(text))
+        if not matches:
+            continue
+        match = matches[-1]
+        value = ""
+        for group in match.groups():
+            if group:
+                value = group
+                break
+        if not value:
+            value = match.group(0)
+        evidence = {
+            "value": value,
+            "comment_id": comment.get("id"),
+            "date_creation": comment.get("date_creation"),
+        }
+        return evidence
+    return None
+
+
+def _comment_evidence_detail(evidence):
+    if not evidence:
+        return ""
+    parts = [str(evidence.get("value") or "")]
+    if evidence.get("comment_id") is not None:
+        parts.append("from comment #%s" % evidence.get("comment_id"))
+    if evidence.get("date_creation"):
+        try:
+            parts.append("at %s" % _utc_iso(int(evidence.get("date_creation"))))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return " ".join(part for part in parts if part)
+
+
 def _git_worktree_info(repo):
     info = {"available": False, "repo": repo}
     if not repo or not os.path.isdir(repo):
@@ -2058,9 +2105,11 @@ def _closeout_report(cfg, task_id, require_validation=False, require_commit=Fals
         "validation evidence found in comments" if validation_seen else "no validation evidence found in comments",
         strict or require_validation)
 
-    commit_match = _COMMIT_RE.search(text)
-    commit_seen = bool(commit_match or git_info.get("head"))
-    commit_detail = (commit_match.group(1) or commit_match.group(2)) if commit_match else git_info.get("head")
+    commit_evidence = _latest_comment_regex_evidence(comments, _COMMIT_RE)
+    commit_seen = bool(commit_evidence or git_info.get("head"))
+    commit_detail = _comment_evidence_detail(commit_evidence) if commit_evidence else (
+        "current git HEAD %s" % git_info.get("head") if git_info.get("head") else None
+    )
     add("commit_id", "pass" if commit_seen else "warn",
         commit_detail or "no commit id found in comments and no git HEAD available",
         require_commit)

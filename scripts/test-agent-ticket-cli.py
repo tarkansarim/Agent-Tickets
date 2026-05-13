@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -270,6 +271,112 @@ class AgentTicketCliTests(unittest.TestCase):
         commit = [c for c in report["checks"] if c["name"] == "commit_id"][0]
         self.assertEqual("warn", commit["status"])
         self.assertIn("no commit id", commit["detail"])
+
+    def test_closeout_commit_evidence_prefers_latest_comment_and_reports_source(self):
+        task = {"id": 49, "column_id": 5, "swimlane_id": 1, "is_active": 0}
+        comments = [
+            {
+                "id": 10,
+                "date_creation": 100,
+                "comment": "Partial progress. Validation: tests OK. Commit ab0da7d.",
+            },
+            {
+                "id": 11,
+                "date_creation": 200,
+                "comment": "Final closeout. Validation: tests OK. Commit 180e868.",
+            },
+        ]
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "_ticket_comments", return_value=comments), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "column_name", return_value="Done"), \
+             mock.patch.object(self.cli, "_git_worktree_info", return_value={"available": True, "clean": True, "head": "9999999"}):
+            report = self.cli._closeout_report({"project_id": 1}, 49, strict=True, require_commit=True)
+
+        self.assertTrue(report["ok"])
+        commit = [c for c in report["checks"] if c["name"] == "commit_id"][0]
+        self.assertEqual("pass", commit["status"])
+        self.assertIn("180e868", commit["detail"])
+        self.assertIn("comment #11", commit["detail"])
+        self.assertNotIn("ab0da7d", commit["detail"])
+
+    def test_notify_hook_codex_stop_mode_is_silent_for_new_tickets(self):
+        home = pathlib.Path(self.tmpdir.name) / "home"
+        cli_dir = home / ".local" / "bin"
+        cli_dir.mkdir(parents=True)
+        fake_cli = cli_dir / "agent-ticket"
+        fake_cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if sys.argv[1:4] == ['list', '--project', 'agent-tickets'] and sys.argv[4:] == ['--json']:\n"
+            "    print(json.dumps([{'id': 72, 'title': 'Hook JSON', 'tags': ['project:agent-tickets'], 'url': 'u'}]))\n"
+            "elif sys.argv[1:4] == ['callbacks', '--pending', '--repo']:\n"
+            "    print('Pending callback text')\n"
+        )
+        fake_cli.chmod(0o755)
+        work = pathlib.Path(self.tmpdir.name) / "agent-tickets"
+        work.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "XDG_CACHE_HOME": str(pathlib.Path(self.tmpdir.name) / "cache"),
+        }
+        hook = ROOT / "scripts" / "notify-hook.sh"
+
+        baseline = subprocess.run(
+            [str(hook), "baseline"],
+            cwd=str(work),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("Open agent-ticket(s)", baseline.stdout)
+
+        codex_stop = subprocess.run(
+            [str(hook), "codex-stop-changes"],
+            cwd=str(work),
+            env={**env, "XDG_CACHE_HOME": str(pathlib.Path(self.tmpdir.name) / "cache-codex")},
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual("", codex_stop.stdout)
+
+    def test_register_hooks_replaces_old_codex_stop_notify_command(self):
+        home = pathlib.Path(self.tmpdir.name) / "home"
+        codex_dir = home / ".codex"
+        codex_dir.mkdir(parents=True)
+        hook = pathlib.Path(self.tmpdir.name) / "notify-hook.sh"
+        hook.write_text("#!/bin/sh\n")
+        hooks_path = codex_dir / "hooks.json"
+        hooks_path.write_text(json.dumps({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "%s changes" % hook, "timeout": 10}]},
+                    {"hooks": [{"type": "command", "command": "python3 rewind.py", "timeout": 300}]},
+                ]
+            }
+        }, indent=2))
+
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "register-hooks.py"), str(hook)],
+            env={**os.environ, "HOME": str(home)},
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        data = json.loads(hooks_path.read_text())
+        stop_commands = [
+            h["command"]
+            for group in data["hooks"]["Stop"]
+            for h in group.get("hooks", [])
+        ]
+        self.assertIn("%s codex-stop-changes" % hook, stop_commands)
+        self.assertIn("python3 rewind.py", stop_commands)
+        self.assertNotIn("%s changes" % hook, stop_commands)
 
     def test_supervise_dry_run_launches_fresh_without_trusting_stale_latest(self):
         task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
