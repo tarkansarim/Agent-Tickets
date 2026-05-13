@@ -1840,6 +1840,13 @@ def _supervise_launch_session_name(prefix, project, task_id):
     return _safe_session_name(prefix, "%s-%d" % (project or "ticket", int(task_id)))
 
 
+def _tmux_stdout_is_exact_session(result, session):
+    if not result.get("ok") or not session:
+        return False
+    lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
+    return lines == [session]
+
+
 def _ticket_comments(cfg, task_id):
     return rpc(cfg, "getAllComments", {"task_id": int(task_id)}) or []
 
@@ -3199,9 +3206,10 @@ def cmd_supervise(cfg, args):
         provider = args.provider
         latest = None
         existing = None
+        session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
         if provider in (None, "codex"):
             latest = _agent_tmux(["codex-latest", repo], timeout=10)
-            existing = _agent_tmux(["codex-existing", repo], timeout=10)
+            existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
             if provider is None and (latest.get("ok") or existing.get("ok")):
                 provider = "codex"
         if provider != "codex":
@@ -3212,14 +3220,44 @@ def cmd_supervise(cfg, args):
             )
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
-        session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
-        selected = {
-            "provider": "codex",
-            "session": session,
-            "mode": "resume-latest" if latest and latest.get("ok") else "launch",
-            "latest": latest,
-            "existing": existing,
-        }
+        if _tmux_stdout_is_exact_session(existing or {}, session):
+            exact_probe = _agent_contact(repo, "codex", message, dry_run=True, session=session)
+            kind, info = _classify_probe(exact_probe)
+            if kind == "ok":
+                selected = {
+                    "provider": "codex",
+                    "session": session,
+                    "mode": "contact",
+                    "probe": exact_probe,
+                    "latest": latest,
+                    "existing": existing,
+                }
+            else:
+                route.update({
+                    "provider": "codex",
+                    "session": session,
+                    "mode": "contact",
+                    "full_permission": bool(args.full_permission),
+                    "status": "blocked",
+                })
+                detail = "requested session %s already exists but guarded contact refused: %s" % (session, info)
+                result = _supervision_blocked(cfg, args, "existing session not contactable", detail, args.id)
+                result.update({
+                    "route": route,
+                    "refused": refused,
+                    "existing_ticket_session": existing,
+                    "contact_probe": exact_probe,
+                })
+                out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+                return
+        if selected is None:
+            selected = {
+                "provider": "codex",
+                "session": session,
+                "mode": "resume-latest" if latest and latest.get("ok") else "launch",
+                "latest": latest,
+                "existing": existing,
+            }
 
     route["provider"] = selected["provider"]
     route["session"] = selected.get("session") or args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)

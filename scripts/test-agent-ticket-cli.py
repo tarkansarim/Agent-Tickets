@@ -395,6 +395,113 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("codex-resume-latest", tmux_calls[-1][0])
         self.assertEqual("owner-demo-47", tmux_calls[-1][1])
 
+    def test_supervise_reuses_existing_ticket_session_through_guarded_contact(self):
+        task = {"id": 58, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+        contact_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            contact_calls.append((provider, dry_run, session))
+            if provider == "codex" and session == "owner-demo-58":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send" if dry_run else "sent", "session": "owner-demo-58"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {"ok": False, "rc": 3, "json": {"reason": "no pane"}, "stderr": "", "raw": ""}
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-latest":
+                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+            if argv[0] == "codex-existing":
+                if len(argv) == 3 and argv[2] == "owner-demo-58":
+                    return {"ok": True, "rc": 0, "stdout": "owner-demo-58", "stderr": "", "argv": ["agent-tmux"] + argv}
+                return {"ok": False, "rc": 2, "stdout": "", "stderr": "multiple detached Codex tmux sessions", "argv": ["agent-tmux"] + argv}
+            self.fail("existing ticket session should be contacted, not launched")
+
+        args = argparse.Namespace(
+            id=58, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=False, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Agent working"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment"), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("routed", result["status"])
+        self.assertEqual("contact", result["route"]["mode"])
+        self.assertEqual("owner-demo-58", result["route"]["session"])
+        self.assertIn(("codex", True, "owner-demo-58"), contact_calls)
+        self.assertIn(("codex", False, "owner-demo-58"), contact_calls)
+        self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
+
+    def test_supervise_blocks_existing_ticket_session_when_guarded_contact_refuses(self):
+        task = {"id": 58, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            reason = "no tmux-managed codex pane found for /tmp/demo in session 'owner-demo-58'" if session else "no pane"
+            return {"ok": False, "rc": 3, "json": {"reason": reason}, "stderr": "", "raw": ""}
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-latest":
+                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+            if argv[0] == "codex-existing":
+                if len(argv) == 3 and argv[2] == "owner-demo-58":
+                    return {"ok": True, "rc": 0, "stdout": "owner-demo-58", "stderr": "", "argv": ["agent-tmux"] + argv}
+                return {"ok": False, "rc": 2, "stdout": "", "stderr": "multiple detached Codex tmux sessions", "argv": ["agent-tmux"] + argv}
+            self.fail("unsafe existing ticket session should block before launch")
+
+        args = argparse.Namespace(
+            id=58, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Agent working"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("existing session not contactable", result["reason"])
+        self.assertEqual("owner-demo-58", result["route"]["session"])
+        self.assertEqual("owner-demo-58", result["existing_ticket_session"]["stdout"])
+        self.assertIn("owner-demo-58", result["detail"])
+        self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
+        audit.assert_not_called()
+
     def test_register_origin_watcher_persists_metadata_and_audit_comment(self):
         args = argparse.Namespace(
             watch_origin=True,
