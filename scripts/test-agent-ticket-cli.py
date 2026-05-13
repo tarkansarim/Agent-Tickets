@@ -984,6 +984,81 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
         audit.assert_not_called()
 
+    def test_supervise_send_refusal_reports_dry_run_session_context(self):
+        task = {"id": 70, "title": "Fix routing mismatch", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        contact_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            contact_calls.append((provider, dry_run, session))
+            if provider == "codex" and session == "owner-agent-tickets":
+                if dry_run:
+                    return {
+                        "ok": True,
+                        "rc": 0,
+                        "json": {
+                            "status": "would_send",
+                            "session": "owner-agent-tickets",
+                            "pane_state": "idle_empty_prompt",
+                        },
+                        "stderr": "",
+                        "raw": "{}",
+                    }
+                return {
+                    "ok": False,
+                    "rc": 3,
+                    "json": {
+                        "reason": "codex starter placeholder has no pending user text",
+                        "session": "owner-agent-tickets",
+                        "pane_state": "idle_empty_prompt",
+                    },
+                    "stderr": "",
+                    "raw": "",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo in session 'owner-agent-tickets'" % provider},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=70, provider="codex", session="owner-agent-tickets", session_prefix="owner",
+            full_permission=False, message="", dry_run=False, no_tool_ticket=True,
+            poll_interval=0, max_polls=0, strict_closeout=False, require_clean=False,
+            require_validation=False, require_commit=False, require_install=False, json=True,
+            watch_origin=False, supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("send refused", result["reason"])
+        self.assertIn("guarded dry-run accepted codex session owner-agent-tickets", result["detail"])
+        self.assertIn("status=would_send", result["detail"])
+        self.assertIn("live send refused", result["detail"])
+        self.assertIn("codex starter placeholder has no pending user text", result["detail"])
+        self.assertEqual("owner-agent-tickets", result["route"]["session"])
+        self.assertEqual("would_send", result["contact_probe"]["json"]["status"])
+        self.assertIn(("codex", True, "owner-agent-tickets"), contact_calls)
+        self.assertIn(("codex", False, "owner-agent-tickets"), contact_calls)
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
     def test_register_origin_watcher_persists_metadata_and_audit_comment(self):
         args = argparse.Namespace(
             watch_origin=True,
@@ -1221,6 +1296,77 @@ class AgentTicketCliTests(unittest.TestCase):
             self.cli.cmd_new({"project_id": 1}, args)
 
         self.assertIn("requires --dispatch", str(caught.exception))
+
+    def test_new_without_dispatch_prompts_agent_to_ask_user_about_guarded_routing(self):
+        args = argparse.Namespace(
+            project="demo", force=True, watch_origin=False, dispatch=False, tag=None, agent="codex",
+            severity="p2", title="Demo issue", column="New", body="body", kind="bug", json=False,
+        )
+        task = {"id": 70, "title": "Demo issue", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+
+        def fake_rpc(cfg, method, params=None):
+            if method == "createTask":
+                return 70
+            if method == "getTask":
+                return task
+            self.fail("unexpected rpc call %s" % method)
+
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "resolve_column_id", return_value=1), \
+             mock.patch.object(self.cli, "resolve_category_id", return_value=2), \
+             mock.patch.object(self.cli, "rpc", side_effect=fake_rpc), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "agent:codex", "p2"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_new({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://kanboard.invalid/jsonrpc.php",
+            }, args)
+
+        text = out.getvalue()
+        self.assertIn("Created ticket #70", text)
+        self.assertIn("Ask the user now", text)
+        self.assertIn("agent-ticket dispatch 70", text)
+        self.assertIn("agent-ticket supervise 70 --full-permission", text)
+        contact.assert_not_called()
+
+    def test_new_without_dispatch_json_includes_owner_agent_routing_prompt(self):
+        args = argparse.Namespace(
+            project="demo", force=True, watch_origin=False, dispatch=False, tag=None, agent="codex",
+            severity="p2", title="Demo issue", column="New", body="body", kind="bug", json=True,
+        )
+        task = {"id": 70, "title": "Demo issue", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+
+        def fake_rpc(cfg, method, params=None):
+            if method == "createTask":
+                return 70
+            if method == "getTask":
+                return task
+            self.fail("unexpected rpc call %s" % method)
+
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "resolve_column_id", return_value=1), \
+             mock.patch.object(self.cli, "resolve_category_id", return_value=2), \
+             mock.patch.object(self.cli, "rpc", side_effect=fake_rpc), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "agent:codex", "p2"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_new({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://kanboard.invalid/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        prompt = result["owner_agent_routing_prompt"]
+        self.assertTrue(prompt["ask_user"])
+        self.assertEqual("demo", prompt["project"])
+        self.assertEqual("/tmp/demo", prompt["repo"])
+        commands = [route["command"] for route in prompt["approved_routes"]]
+        self.assertIn("agent-ticket dispatch 70", commands)
+        self.assertIn("agent-ticket supervise 70 --full-permission", commands)
 
     def test_concurrent_watcher_registrations_preserve_both_tickets(self):
         def register(ticket_id):

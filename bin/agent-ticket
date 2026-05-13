@@ -1774,6 +1774,72 @@ def resolve_repo_path(cfg, name):
     return None
 
 
+def _owner_agent_routing_prompt(cfg, task_id, tags, column):
+    task_id = int(task_id)
+    pname = project_tag(tags)
+    prompt = {
+        "ask_user": False,
+        "ticket_id": task_id,
+        "project": pname,
+        "repo": None,
+        "reason": None,
+        "question": None,
+        "approved_routes": [],
+        "safety": (
+            "Ticket filing is separate from owner-agent routing; do not run a route command "
+            "unless the user explicitly approves or originally requested dispatch."
+        ),
+    }
+    if not pname:
+        prompt["reason"] = "no project tag"
+        return prompt
+    if column in ("Needs human", "Done", "Agent working"):
+        prompt["reason"] = "ticket is in %s" % column
+        return prompt
+    repo = resolve_repo_path(cfg, pname)
+    if not repo:
+        prompt["reason"] = "unresolved repo"
+        return prompt
+
+    prompt.update({
+        "ask_user": True,
+        "repo": repo,
+        "reason": "explicit approval required",
+        "question": "Do you want me to route the owning repo agent for ticket #%d now?" % task_id,
+        "approved_routes": [
+            {
+                "kind": "dispatch",
+                "command": "agent-ticket dispatch %d" % task_id,
+                "description": "best-effort guarded contact of an existing safe owner session",
+            },
+            {
+                "kind": "supervise",
+                "command": "agent-ticket supervise %d --full-permission" % task_id,
+                "description": "guarded supervised route that may launch a deterministic owner worker",
+            },
+        ],
+    })
+    if severity_tag(tags) == "p3":
+        prompt["note"] = (
+            "This ticket is p3; dispatch intentionally skips p3 by default, so use supervised "
+            "routing only if the user explicitly wants the owner agent interrupted."
+        )
+    return prompt
+
+
+def _format_owner_agent_routing_prompt(prompt):
+    if not (prompt or {}).get("ask_user"):
+        return ""
+    lines = ["Ask the user now: %s" % prompt["question"]]
+    lines.append("  Approved guarded routes after explicit approval:")
+    for route in prompt.get("approved_routes") or []:
+        lines.append("    %s  # %s" % (route.get("command"), route.get("description")))
+    if prompt.get("note"):
+        lines.append("  Note: %s" % prompt["note"])
+    lines.append("  Safety: %s" % prompt["safety"])
+    return "\n".join(lines)
+
+
 _TITLE_WS_RE = re.compile(r"\s+")
 _TITLE_TOK_RE = re.compile(r"[a-z0-9]+")
 _TITLE_STOPWORDS = frozenset((
@@ -2076,13 +2142,19 @@ def cmd_new(cfg, args):
         sys.exit("agent-ticket: createTask failed")
     task = rpc(cfg, "getTask", {"task_id": int(task_id)})
     url = web_url(cfg, "task/%d" % int(task_id))
-    new_obj = {"task": task, "tags": task_tags(cfg, task_id), "url": url}
+    new_tags = task_tags(cfg, task_id)
+    new_obj = {"task": task, "tags": new_tags, "url": url}
     new_human = "Created ticket #%s — %s\n  %s" % (task_id, _san(args.title), url)
     watcher = _register_origin_watcher(cfg, task_id, args, "new --dispatch" if getattr(args, "dispatch", False) else "new")
     if watcher:
         new_obj["watcher"] = watcher
     # --- optional: ping the owner agent right after filing -----------------
     if not getattr(args, "dispatch", False):
+        routing_prompt = _owner_agent_routing_prompt(cfg, task_id, new_tags, args.column)
+        new_obj["owner_agent_routing_prompt"] = routing_prompt
+        routing_text = _format_owner_agent_routing_prompt(routing_prompt)
+        if routing_text:
+            new_human = "%s\n\n%s" % (new_human, routing_text)
         out(args, new_obj, new_human); return
     d_args = argparse.Namespace(
         id=int(task_id),
@@ -2284,6 +2356,28 @@ def _supervise_route_note(route):
     if route.get("mode") == "contact":
         return "guarded contact accepted"
     return ""
+
+
+def _supervise_contact_probe_summary(selected, route):
+    selected = selected or {}
+    route = route or {}
+    probe = selected.get("probe") or {}
+    payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
+    provider = selected.get("provider") or route.get("provider") or "?"
+    session = _contactable_session(selected) or route.get("session") or payload.get("session") or "(auto-discovered)"
+    parts = ["guarded dry-run accepted %s session %s" % (provider, session)]
+    if payload.get("status"):
+        parts.append("status=%s" % payload.get("status"))
+    if payload.get("pane_state"):
+        parts.append("state=%s" % payload.get("pane_state"))
+    return ", ".join(parts)
+
+
+def _supervise_send_refusal_detail(selected, route, send):
+    return "%s; live send refused: %s" % (
+        _supervise_contact_probe_summary(selected, route),
+        _probe_reason(send),
+    )
 
 
 def _batch_ticket_summary(cfg, ticket, tags, column=None, kind=None):
@@ -3410,7 +3504,18 @@ def cmd_supervise(cfg, args):
         send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=route.get("session"))
         if not send.get("ok"):
             _release_supervision_claim(claim_id)
-            result = _supervision_blocked(cfg, args, "send refused", _probe_reason(send), args.id)
+            result = _supervision_blocked(
+                cfg,
+                args,
+                "send refused",
+                _supervise_send_refusal_detail(selected, route, send),
+                args.id,
+            )
+            result.update({
+                "route": route,
+                "contact_probe": selected.get("probe"),
+                "send": send,
+            })
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
         route["sent"] = send.get("json") or send.get("raw")
