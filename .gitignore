@@ -8,6 +8,7 @@ SESSION-*.jsonl
 
 # generated / local cruft
 __pycache__/
+.venv/
 *.py[cod]
 *.log
 .pytest_cache/

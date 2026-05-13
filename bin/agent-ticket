@@ -41,6 +41,9 @@ DEFAULT_WATCH_EXPIRES_HOURS = 72
 CALLBACK_DELIVERING_STALE_SECONDS = 300
 DEFAULT_BATCH_SESSION_PREFIX = "batch-owner"
 DEFAULT_SUPERVISION_TTL_HOURS = 6
+SUPERVISE_RESUME_LATEST_SKIP_REASON = (
+    "fresh ticket-scoped owner lane required; codex-latest/resume-latest is not deterministic owner evidence"
+)
 
 KIND_CHOICES = ["bug", "friction", "request", "blocker", "question", "idea", "regression"]
 SEVERITY_CHOICES = ["p1", "p2", "p3"]
@@ -857,6 +860,58 @@ def _supervision_claim_detail(claims):
             )
         )
     return "; ".join(parts) or "active supervision claim exists"
+
+
+def _supervision_worker_identities(supervision_preflight):
+    identities = set()
+    for claim in (supervision_preflight or {}).get("owned_claims") or []:
+        provider = (claim.get("worker_provider") or "").strip()
+        session = (claim.get("worker_session") or "").strip()
+        if provider and session:
+            identities.add((provider, session))
+    return identities
+
+
+def _contactable_session(candidate):
+    session = (candidate or {}).get("session")
+    if session:
+        return session
+    probe = (candidate or {}).get("probe") or {}
+    payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
+    return payload.get("session")
+
+
+def _filter_bound_contactable(contactable, supervision_preflight=None, explicit_session=None, extra_identities=None):
+    allowed_identities = _supervision_worker_identities(supervision_preflight)
+    for provider, session in extra_identities or []:
+        if provider and session:
+            allowed_identities.add((provider, session))
+    if not contactable:
+        return [], []
+    if not allowed_identities and not explicit_session:
+        return [], list(contactable)
+    accepted, rejected = [], []
+    for candidate in contactable:
+        provider = (candidate or {}).get("provider")
+        session = _contactable_session(candidate)
+        if explicit_session and not session:
+            session = explicit_session
+        identity = (provider, session) if provider and session else None
+        if identity and (identity in allowed_identities or session == explicit_session):
+            accepted.append({**candidate, "session": session})
+        else:
+            rejected.append(candidate)
+    return accepted, rejected
+
+
+def _contactable_identity_detail(contactable):
+    parts = []
+    for candidate in contactable or []:
+        parts.append("%s session %s" % (
+            candidate.get("provider") or "?",
+            _contactable_session(candidate) or "(unknown)",
+        ))
+    return ", ".join(parts) or "contactable session lacks explicit supervision owner identity"
 
 
 def _supervision_claim_id(repo, ticket_ids, owner_id):
@@ -2215,6 +2270,22 @@ def _supervision_message(cfg, task_id, pname, title, args):
     )
 
 
+def _resume_latest_skipped():
+    return {
+        "status": "skipped",
+        "reason": SUPERVISE_RESUME_LATEST_SKIP_REASON,
+    }
+
+
+def _supervise_route_note(route):
+    resume_latest = route.get("resume_latest") or {}
+    if route.get("mode") == "launch" and resume_latest.get("status") == "skipped":
+        return "fresh ticket-scoped owner lane; resume-latest skipped: %s" % resume_latest.get("reason")
+    if route.get("mode") == "contact":
+        return "guarded contact accepted"
+    return ""
+
+
 def _batch_ticket_summary(cfg, ticket, tags, column=None, kind=None):
     column = column or column_name(cfg, ticket["column_id"])
     kind = kind if kind is not None else category_name(cfg, ticket.get("category_id"))
@@ -2256,7 +2327,11 @@ def _batch_refusal_detail(refusals):
 
 
 def _batch_contact_absence_repo(reason):
-    match = re.search(r"\bno tmux-managed\b.*\bpane found for\s+(.+?)\s*$", reason or "", re.IGNORECASE)
+    match = re.search(
+        r"\bno tmux-managed\b.*\bpane found for\s+(.+?)(?:\s+in\s+session\s+.+)?\s*$",
+        reason or "",
+        re.IGNORECASE,
+    )
     return match.group(1).strip() if match else None
 
 
@@ -2302,31 +2377,8 @@ def _batch_codex_existing_is_absent(result, expected_repo=None):
     )
 
 
-def _batch_codex_latest_is_absent(result, expected_repo=None):
-    if result.get("ok"):
-        return False
-    stderr_lines = (result.get("stderr") or "").strip().splitlines()
-    prefix = "agent-tmux: no Codex session found for workdir:"
-    return bool(
-        int(result.get("rc") or 0) == 1
-        and not (result.get("stdout") or "").strip()
-        and len(stderr_lines) == 1
-        and _batch_absence_workdir_matches(stderr_lines[0], prefix, expected_repo)
-    )
-
-
 def _batch_tmux_failure_detail(result):
     return _first_line(result.get("stderr")) or _first_line(result.get("stdout")) or "agent-tmux exited rc=%s" % result.get("rc")
-
-
-def _batch_valid_codex_latest_output(result):
-    if (result.get("stderr") or "").strip():
-        return False
-    lines = (result.get("stdout") or "").strip().splitlines()
-    if len(lines) != 1:
-        return False
-    parts = lines[0].split("\t")
-    return len(parts) == 4 and all(part.strip() for part in parts)
 
 
 def _batch_codex_existing_block(group, refused):
@@ -2587,7 +2639,7 @@ def _batch_revalidate_group_for_route(cfg, args, group, context="route"):
     return updated, None
 
 
-def _batch_select_route(args, group, message):
+def _batch_select_route(args, group, message, supervision_preflight=None):
     requested_provider = getattr(args, "provider", None)
     contactable_all, refused = _contactable_providers(group["repo"], message, providers=DISPATCH_PROVIDERS)
     unsafe_refusals = _batch_unsafe_contact_refusals(refused, group["repo"])
@@ -2601,12 +2653,24 @@ def _batch_select_route(args, group, message):
             "refused": refused,
         }
 
-    contactable = [
-        c for c in contactable_all
-        if not requested_provider or c["provider"] == requested_provider
-    ]
+    bound_contactable, unbound_contactable = _filter_bound_contactable(
+        contactable_all,
+        supervision_preflight=supervision_preflight,
+    )
+    if unbound_contactable:
+        return {
+            "status": "blocked",
+            "reason": "unbound contactable session",
+            "detail": "contactable session is not tied to an active supervision claim: %s"
+                      % _contactable_identity_detail(unbound_contactable),
+            "provider": requested_provider,
+            "session": None,
+            "refused": refused,
+            "contactable": contactable_all,
+        }
+
     other_contactable = [
-        c for c in contactable_all
+        c for c in bound_contactable
         if requested_provider and c["provider"] != requested_provider
     ]
     if requested_provider and other_contactable:
@@ -2619,6 +2683,10 @@ def _batch_select_route(args, group, message):
             "refused": refused,
             "contactable": contactable_all,
         }
+    contactable = [
+        c for c in bound_contactable
+        if not requested_provider or c["provider"] == requested_provider
+    ]
     if len(contactable) > 1 and not getattr(args, "provider", None):
         return {
             "status": "blocked",
@@ -2636,7 +2704,7 @@ def _batch_select_route(args, group, message):
             "status": "planned",
             "mode": "contact",
             "provider": selected["provider"],
-            "session": selected.get("session") or "(auto-discovered)",
+            "session": _contactable_session(selected),
             "repo": group["repo"],
             "refused": refused,
         }
@@ -2654,41 +2722,19 @@ def _batch_select_route(args, group, message):
     if existing_block:
         return existing_block
 
-    latest = _agent_tmux(["codex-latest", group["repo"]], timeout=10)
-    if not latest.get("ok") and not _batch_codex_latest_is_absent(latest, group["repo"]):
-        return {
-            "status": "blocked",
-            "reason": "agent-tmux latest lookup failed",
-            "detail": _batch_tmux_failure_detail(latest),
-            "provider": "codex",
-            "session": None,
-            "refused": refused,
-            "latest": latest,
-            "existing": existing,
-        }
-    if latest.get("ok") and not _batch_valid_codex_latest_output(latest):
-        return {
-            "status": "blocked",
-            "reason": "agent-tmux latest lookup failed",
-            "detail": "codex-latest returned malformed success output",
-            "provider": "codex",
-            "session": None,
-            "refused": refused,
-            "latest": latest,
-            "existing": existing,
-        }
     session = _safe_session_name(getattr(args, "session_prefix", DEFAULT_BATCH_SESSION_PREFIX),
                                  group.get("session_key") or group["project"])
-    return {
+    route = {
         "status": "planned",
-        "mode": "resume-latest" if latest.get("ok") else "launch",
+        "mode": "launch",
         "provider": "codex",
         "session": session,
         "repo": group["repo"],
         "refused": refused,
-        "latest": latest,
         "existing": existing,
+        "resume_latest": _resume_latest_skipped(),
     }
+    return route
 
 
 def _batch_route_group(cfg, args, group):
@@ -2722,7 +2768,7 @@ def _batch_route_group(cfg, args, group):
             "closeouts": {},
         }
     message = _batch_supervision_message(cfg, group, args)
-    route = _batch_select_route(args, group, message)
+    route = _batch_select_route(args, group, message, supervision_preflight=supervision_preflight)
     result = {
         "project": group["project"],
         "repo": group["repo"],
@@ -2744,7 +2790,7 @@ def _batch_route_group(cfg, args, group):
         route["detail"] = stale_reason
         return result
     message = _batch_supervision_message(cfg, group, args)
-    route = _batch_select_route(args, group, message)
+    route = _batch_select_route(args, group, message, supervision_preflight=supervision_preflight)
     result["route"] = route
     result["tickets"] = group["tickets"]
     result["project"] = group["project"]
@@ -2805,7 +2851,7 @@ def _batch_route_group(cfg, args, group):
         result["tickets"] = group["tickets"]
         result["project"] = group["project"]
         message = _batch_supervision_message(cfg, group, args)
-        cmd_name = "codex-resume-latest" if route["mode"] == "resume-latest" else "codex"
+        cmd_name = "codex"
         if getattr(args, "full_permission", False):
             cmd_name += "-full"
         prelaunch_block, prelaunch_existing = _batch_codex_existing_block(group, route.get("refused") or [])
@@ -2849,6 +2895,7 @@ def _batch_route_group(cfg, args, group):
     project_label = _batch_group_project_label(group)
     for index, ticket in enumerate(group["tickets"], 1):
         current_ticket = ticket
+        route_note = _supervise_route_note(route)
         if ticket.get("column") == "New":
             try:
                 current_group, stale_reason = _batch_revalidate_group_for_route(
@@ -2876,9 +2923,10 @@ def _batch_route_group(cfg, args, group):
         audit_comment(
             cfg,
             ticket["id"],
-            "supervise-batch: queued item %d/%d for project:%s (repo group: %s) to %s session %s via %s"
+            "supervise-batch: queued item %d/%d for project:%s (repo group: %s) to %s session %s via %s%s"
             % (index, len(group["tickets"]), ticket.get("project") or group["project"], project_label,
-               route["provider"], route["session"], route["mode"]),
+               route["provider"], route["session"], route["mode"],
+               (" (%s)" % route_note) if route_note else ""),
         )
         if current_ticket.get("column") == "New":
             try:
@@ -3189,30 +3237,69 @@ def cmd_supervise(cfg, args):
         return
 
     message = _supervision_message(cfg, args.id, pname, title, args)
-    providers = [args.provider] if args.provider else DISPATCH_PROVIDERS
-    contactable, refused = _contactable_providers(repo, message, session=args.session, providers=providers)
+    requested_provider = args.provider
+    session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
+    contactable_all, refused = _contactable_providers(repo, message, session=args.session, providers=DISPATCH_PROVIDERS)
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
 
-    if len(contactable) > 1 and not args.provider:
+    unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo)
+    if unsafe_refusals:
+        result = _supervision_blocked(
+            cfg, args, "unsafe provider refusal",
+            _batch_refusal_detail(unsafe_refusals),
+            args.id,
+        )
+        result.update({"refused": refused})
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+
+    bound_contactable, unbound_contactable = _filter_bound_contactable(
+        contactable_all,
+        supervision_preflight=supervision_preflight,
+        explicit_session=args.session,
+        extra_identities=[("codex", session)],
+    )
+    if unbound_contactable:
+        result = _supervision_blocked(
+            cfg, args, "unbound contactable session",
+            "contactable session is not tied to this supervision route: %s"
+            % _contactable_identity_detail(unbound_contactable),
+            args.id,
+        )
+        result.update({"contactable": contactable_all, "refused": refused})
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+
+    contactable = [
+        c for c in bound_contactable
+        if not requested_provider or c["provider"] == requested_provider
+    ]
+    other_contactable = [
+        c for c in bound_contactable
+        if requested_provider and c["provider"] != requested_provider
+    ]
+    if requested_provider and other_contactable:
+        result = _supervision_blocked(
+            cfg, args, "provider conflict",
+            "existing contactable provider(s) for repo: %s" % ", ".join(c["provider"] for c in other_contactable),
+            args.id,
+        )
+        result.update({"contactable": contactable_all, "refused": refused})
+        out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+        return
+    if len(contactable) > 1 and not requested_provider:
         result = _supervision_blocked(cfg, args, "ambiguous provider",
                                       "contactable providers: %s" % ", ".join(c["provider"] for c in contactable),
                                       args.id)
         out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
         return
     if contactable:
-        selected = {**contactable[0], "mode": "contact"}
+        selected = {**contactable[0], "session": _contactable_session(contactable[0]), "mode": "contact"}
     else:
-        provider = args.provider
-        latest = None
+        provider = requested_provider
         existing = None
-        session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
-        if provider in (None, "codex"):
-            latest = _agent_tmux(["codex-latest", repo], timeout=10)
-            existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
-            if provider is None and (latest.get("ok") or existing.get("ok")):
-                provider = "codex"
-        if provider != "codex":
+        if provider not in (None, "codex"):
             result = _supervision_blocked(
                 cfg, args, "no contactable session",
                 "; ".join("%s: %s" % (r["provider"], r["reason"]) for r in refused) or "no contactable session",
@@ -3220,6 +3307,9 @@ def cmd_supervise(cfg, args):
             )
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
+
+        provider = "codex"
+        existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
         if _tmux_stdout_is_exact_session(existing or {}, session):
             exact_probe = _agent_contact(repo, "codex", message, dry_run=True, session=session)
             kind, info = _classify_probe(exact_probe)
@@ -3229,7 +3319,6 @@ def cmd_supervise(cfg, args):
                     "session": session,
                     "mode": "contact",
                     "probe": exact_probe,
-                    "latest": latest,
                     "existing": existing,
                 }
             else:
@@ -3250,19 +3339,41 @@ def cmd_supervise(cfg, args):
                 })
                 out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
                 return
-        if selected is None:
+        else:
+            if existing and existing.get("ok"):
+                result = _supervision_blocked(
+                    cfg, args, "agent-tmux existing lookup failed",
+                    "codex-existing returned unexpected session output for requested session %s: %s"
+                    % (session, _first_line(existing.get("stdout")) or "(empty stdout)"),
+                    args.id,
+                )
+                result.update({"existing_ticket_session": existing})
+                out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+                return
+            if not _batch_codex_existing_is_absent(existing or {}, repo):
+                result = _supervision_blocked(
+                    cfg, args, "agent-tmux existing lookup failed",
+                    _batch_tmux_failure_detail(existing or {}),
+                    args.id,
+                )
+                result.update({"existing_ticket_session": existing})
+                out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+                return
             selected = {
                 "provider": "codex",
                 "session": session,
-                "mode": "resume-latest" if latest and latest.get("ok") else "launch",
-                "latest": latest,
+                "mode": "launch",
                 "existing": existing,
+                "resume_latest": _resume_latest_skipped(),
             }
 
     route["provider"] = selected["provider"]
     route["session"] = selected.get("session") or args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
     route["mode"] = selected["mode"]
     route["full_permission"] = bool(args.full_permission)
+    for evidence_key in ("existing", "resume_latest"):
+        if selected.get(evidence_key) is not None:
+            route[evidence_key] = selected[evidence_key]
     watcher_preview = None
     if getattr(args, "watch_origin", False):
         watcher_preview = _origin_watcher_record(args.id, args, "supervise")
@@ -3271,9 +3382,11 @@ def cmd_supervise(cfg, args):
         result["supervision"] = supervision_preflight
         if watcher_preview:
             result["watcher"] = watcher_preview
+        note = _supervise_route_note(route)
         out(args, result,
-            "supervise #%s dry-run: %s %s session %s for %s" % (
-                args.id, route["mode"], route["provider"], route["session"], repo))
+            "supervise #%s dry-run: %s %s session %s for %s%s" % (
+                args.id, route["mode"], route["provider"], route["session"], repo,
+                (" (%s)" % note) if note else ""))
         return
     claim, conflicts = _acquire_supervision_claim(
         args, "supervise", repo, pname, [pname], [args.id], route=route)
@@ -3294,7 +3407,7 @@ def cmd_supervise(cfg, args):
         route["watcher"] = watcher
 
     if selected["mode"] == "contact":
-        send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=selected.get("session"))
+        send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=route.get("session"))
         if not send.get("ok"):
             _release_supervision_claim(claim_id)
             result = _supervision_blocked(cfg, args, "send refused", _probe_reason(send), args.id)
@@ -3308,7 +3421,7 @@ def cmd_supervise(cfg, args):
             if updated_claim:
                 route["supervision"] = _public_supervision_claim(updated_claim, _supervision_owner_id(args))
     else:
-        cmd = ["codex-resume-latest" if selected["mode"] == "resume-latest" else "codex", route["session"], repo]
+        cmd = ["codex", route["session"], repo]
         if args.full_permission:
             cmd += ["-s", "danger-full-access", "-a", "never"]
         cmd.append(message)
@@ -3321,8 +3434,10 @@ def cmd_supervise(cfg, args):
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
 
-    audit_comment(cfg, args.id, "supervise: routed to %s session %s via %s" % (
-        route["provider"], route["session"], route["mode"]))
+    note = _supervise_route_note(route)
+    audit_comment(cfg, args.id, "supervise: routed to %s session %s via %s%s" % (
+        route["provider"], route["session"], route["mode"],
+        (" (%s)" % note) if note else ""))
     if col == "New":
         try:
             move_task_to_column(cfg, t, "Triaging", "move supervised #%s -> Triaging" % args.id)
@@ -3754,11 +3869,11 @@ def main():
                         help="route an owner-agent ticket through agent-contact/agent-tmux and monitor closeout")
     sp.add_argument("id", type=int)
     sp.add_argument("--provider", choices=DISPATCH_PROVIDERS,
-                    help="owner provider lane; auto-detects contactable sessions or Codex latest-chat lane when omitted")
-    sp.add_argument("--session", help="specific tmux session to validate/use")
-    sp.add_argument("--session-prefix", default="owner", help="prefix for deterministic ticket-scoped launched/resumed owner sessions")
+                    help="owner provider lane; auto-detects contactable sessions or launches a fresh Codex lane when omitted")
+    sp.add_argument("--session", help="specific tmux session to validate/use or create when absent")
+    sp.add_argument("--session-prefix", default="owner", help="prefix for deterministic ticket-scoped launched owner sessions")
     sp.add_argument("--full-permission", action="store_true",
-                    help="make Codex launch/resume use visible -s danger-full-access -a never profile")
+                    help="make Codex launch use visible -s danger-full-access -a never profile")
     sp.add_argument("--message", default="", help="extra supervisor note appended to the owner prompt")
     sp.add_argument("--dry-run", action="store_true", help="resolve and print the route without writes/contact/launch")
     sp.add_argument("--no-tool-ticket", action="store_true",
@@ -3793,9 +3908,9 @@ def main():
     sp.add_argument("--provider", choices=DISPATCH_PROVIDERS,
                     help="preferred owner provider lane; all providers are still probed for unsafe existing lanes")
     sp.add_argument("--session-prefix", default=DEFAULT_BATCH_SESSION_PREFIX,
-                    help="prefix for deterministic launched/resumed Codex batch sessions")
+                    help="prefix for deterministic launched Codex batch sessions")
     sp.add_argument("--full-permission", action="store_true",
-                    help="launch/resume Codex workers through agent-tmux full-permission aliases")
+                    help="launch Codex workers through agent-tmux full-permission aliases")
     sp.add_argument("--message", default="", help="extra supervisor note appended to every repo queue prompt")
     sp.add_argument("--dry-run", action="store_true", help="show grouping and route plan without ticket writes, sends, or launches")
     sp.add_argument("--poll-interval", type=float, default=DEFAULT_SUPERVISE_POLL_INTERVAL)

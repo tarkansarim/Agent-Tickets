@@ -98,7 +98,8 @@ class AgentTicketCliTests(unittest.TestCase):
         path.write_text(json.dumps({"version": 1, "claims": claims}, indent=2, sort_keys=True) + "\n")
 
     def active_supervision_claim(self, claim_id="claim-demo", owner_id="other-supervisor",
-                                 repo="/tmp/demo", ticket_ids=None, now=None, ttl=3600):
+                                 repo="/tmp/demo", ticket_ids=None, now=None, ttl=3600,
+                                 worker_session="batch-owner-demo", worker_provider="codex"):
         now = time.time() if now is None else now
         return {
             "claim_id": claim_id,
@@ -112,8 +113,8 @@ class AgentTicketCliTests(unittest.TestCase):
             "origin_provider": "codex",
             "origin_repo": "/tmp/origin",
             "origin_session": "origin-session",
-            "worker_provider": "codex",
-            "worker_session": "batch-owner-demo",
+            "worker_provider": worker_provider,
+            "worker_session": worker_session,
             "worker_mode": "launch",
             "created_at": self.cli._utc_iso(now - 20),
             "created_at_epoch": now - 20,
@@ -270,17 +271,31 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("warn", commit["status"])
         self.assertIn("no commit id", commit["detail"])
 
-    def test_supervise_dry_run_uses_codex_latest_without_contactable_session(self):
+    def test_supervise_dry_run_launches_fresh_without_trusting_stale_latest(self):
         task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
-            return {"ok": False, "rc": 3, "json": {"reason": "no pane"}, "stderr": "", "raw": ""}
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
 
         def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
             if argv[0] == "codex-latest":
-                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+                self.fail("single-ticket supervise must not consult codex-latest")
             if argv[0] == "codex-existing":
-                return {"ok": False, "rc": 1, "stdout": "", "stderr": "none", "argv": ["agent-tmux"] + argv}
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "argv": ["agent-tmux"] + argv,
+                }
             self.fail("dry-run should not launch")
 
         args = argparse.Namespace(
@@ -306,8 +321,11 @@ class AgentTicketCliTests(unittest.TestCase):
         result = json.loads(out.getvalue())
         self.assertTrue(result["ok"])
         self.assertEqual("codex", result["route"]["provider"])
-        self.assertEqual("resume-latest", result["route"]["mode"])
+        self.assertEqual("launch", result["route"]["mode"])
         self.assertEqual("owner-demo-47", result["route"]["session"])
+        self.assertEqual("skipped", result["route"]["resume_latest"]["status"])
+        self.assertIn("fresh", result["route"]["resume_latest"]["reason"])
+        self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
 
     def test_supervise_dry_run_blocks_overlapping_active_supervision_claim(self):
         self.write_supervision_claims({
@@ -350,20 +368,102 @@ class AgentTicketCliTests(unittest.TestCase):
         tmux.assert_not_called()
         audit.assert_not_called()
 
-    def test_supervise_launch_uses_new_ticket_scoped_session_not_existing_session(self):
+    def test_supervise_after_claim_release_launches_fresh_not_latest(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                claim_id="claim-demo", owner_id="current-supervisor", ticket_ids=[47], repo="/tmp/demo"),
+        })
+        release_args = argparse.Namespace(
+            action="release", claim="claim-demo", repo=None, ticket=None, all=False,
+            active_only=False, supervisor_id="current-supervisor", force=False,
+            supervision_ttl_hours=1, origin_repo=None, origin_provider=None, origin_session=None,
+            json=True,
+        )
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.cli.cmd_supervision(None, release_args)
+
+        task = {"id": 47, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            if argv[0] == "codex-latest":
+                self.fail("single-ticket supervise must not consult codex-latest after claim release")
+            self.fail("dry-run should not launch")
+
+        args = argparse.Namespace(
+            id=47, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("owner-demo-47", result["route"]["session"])
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-47"]], tmux_calls)
+        audit.assert_not_called()
+
+    def test_supervise_launch_uses_fresh_ticket_scoped_session_not_resume_latest(self):
         task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
         tmux_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
-            return {"ok": False, "rc": 3, "json": {"reason": "no pane"}, "stderr": "", "raw": ""}
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
 
         def fake_tmux(argv, timeout=25):
             tmux_calls.append(argv)
             if argv[0] == "codex-latest":
-                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+                self.fail("single-ticket supervise must not consult codex-latest")
             if argv[0] == "codex-existing":
-                return {"ok": True, "rc": 0, "stdout": "owner-demo", "stderr": "", "argv": ["agent-tmux"] + argv}
-            if argv[0] == "codex-resume-latest" and argv[1] == "owner-demo-47":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            if argv[0] == "codex" and argv[1] == "owner-demo-47":
                 return {"ok": True, "rc": 0, "stdout": "launched", "stderr": "", "argv": ["agent-tmux"] + argv}
             return {"ok": False, "rc": 2, "stdout": "", "stderr": "requested session already exists", "argv": ["agent-tmux"] + argv}
 
@@ -392,8 +492,330 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("routed", result["status"])
         self.assertEqual("owner-demo-47", result["route"]["session"])
-        self.assertEqual("codex-resume-latest", tmux_calls[-1][0])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("codex", tmux_calls[-1][0])
         self.assertEqual("owner-demo-47", tmux_calls[-1][1])
+        self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
+
+    def test_supervise_blocks_unsafe_contact_refusal_before_fresh_launch(self):
+        task = {"id": 49, "title": "Fix unsafe", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            if provider == "codex":
+                return {
+                    "ok": False,
+                    "rc": 3,
+                    "json": {"reason": "pane busy", "session": "review-demo", "pane_state": "agent_working"},
+                    "stderr": "",
+                    "raw": "",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed claude pane found for /tmp/demo"},
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            return {"ok": True, "rc": 0, "stdout": "unexpected", "stderr": "", "argv": ["agent-tmux"] + argv}
+
+        args = argparse.Namespace(
+            id=49, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("unsafe provider refusal", result["reason"])
+        self.assertIn("review-demo", result["detail"])
+        self.assertEqual([], tmux_calls)
+        audit.assert_not_called()
+
+    def test_supervise_blocks_unsafe_refusal_even_when_other_provider_contactable(self):
+        task = {"id": 50, "title": "Fix unsafe mixed", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            if provider == "codex":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send", "session": "safe-codex-demo"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "pane busy", "session": "busy-claude-demo", "pane_state": "agent_working"},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=50, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("unsafe provider refusal", result["reason"])
+        self.assertIn("busy-claude-demo", result["detail"])
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_blocks_unbound_contactable_stale_review_lane(self):
+        task = {"id": 51, "title": "Fix stale contact", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            if provider == "codex":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send", "session": "review-demo-51"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed claude pane found for /tmp/demo"},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=51, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("unbound contactable session", result["reason"])
+        self.assertIn("review-demo-51", result["detail"])
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_rejects_same_session_wrong_provider_claim_binding(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                claim_id="claim-demo", owner_id="current-supervisor", ticket_ids=[54], repo="/tmp/demo",
+                worker_provider="codex", worker_session="shared-name"),
+        })
+        task = {"id": 54, "title": "Fix provider binding", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            if provider == "claude":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send", "session": "shared-name"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed codex pane found for /tmp/demo"},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=54, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("unbound contactable session", result["reason"])
+        self.assertIn("claude session shared-name", result["detail"])
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_exact_session_send_preserves_session_when_probe_omits_json_session(self):
+        task = {"id": 52, "title": "Fix exact session", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        contact_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            contact_calls.append((provider, dry_run, session))
+            if provider == "codex" and session == "owner-demo-52":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send" if dry_run else "sent"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=52, provider="codex", session="owner-demo-52", session_prefix="owner", full_permission=False,
+            message="", dry_run=False, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment"), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("contact", result["route"]["mode"])
+        self.assertEqual("owner-demo-52", result["route"]["session"])
+        self.assertIn(("codex", True, "owner-demo-52"), contact_calls)
+        self.assertIn(("codex", False, "owner-demo-52"), contact_calls)
+        tmux.assert_not_called()
+
+    def test_supervise_exact_session_absence_launches_without_unsafe_refusal(self):
+        task = {"id": 53, "title": "Fix absent exact session", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {
+                    "reason": "no tmux-managed %s pane found for /tmp/demo in session 'owner-demo-53'" % provider
+                },
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            if argv[0] == "codex-latest":
+                self.fail("single-ticket supervise must not consult codex-latest")
+            self.fail("dry-run should not launch")
+
+        args = argparse.Namespace(
+            id=53, provider="codex", session="owner-demo-53", session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("owner-demo-53", result["route"]["session"])
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-53"]], tmux_calls)
+        audit.assert_not_called()
 
     def test_supervise_reuses_existing_ticket_session_through_guarded_contact(self):
         task = {"id": 58, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
@@ -410,12 +832,18 @@ class AgentTicketCliTests(unittest.TestCase):
                     "stderr": "",
                     "raw": "{}",
                 }
-            return {"ok": False, "rc": 3, "json": {"reason": "no pane"}, "stderr": "", "raw": ""}
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
 
         def fake_tmux(argv, timeout=25):
             tmux_calls.append(argv)
             if argv[0] == "codex-latest":
-                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+                self.fail("single-ticket supervise must not consult codex-latest")
             if argv[0] == "codex-existing":
                 if len(argv) == 3 and argv[2] == "owner-demo-58":
                     return {"ok": True, "rc": 0, "stdout": "owner-demo-58", "stderr": "", "argv": ["agent-tmux"] + argv}
@@ -452,18 +880,72 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn(("codex", False, "owner-demo-58"), contact_calls)
         self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
 
+    def test_supervise_accepts_auto_discovered_default_ticket_session(self):
+        task = {"id": 59, "title": "Fix auto-discovered", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            if provider == "codex" and session is None:
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "would_send", "session": "owner-demo-59"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "no tmux-managed %s pane found for /tmp/demo" % provider},
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=59, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("contact", result["route"]["mode"])
+        self.assertEqual("owner-demo-59", result["route"]["session"])
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
     def test_supervise_blocks_existing_ticket_session_when_guarded_contact_refuses(self):
         task = {"id": 58, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         tmux_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
-            reason = "no tmux-managed codex pane found for /tmp/demo in session 'owner-demo-58'" if session else "no pane"
+            reason = (
+                "no tmux-managed codex pane found for /tmp/demo in session 'owner-demo-58'"
+                if session else
+                "no tmux-managed %s pane found for /tmp/demo" % provider
+            )
             return {"ok": False, "rc": 3, "json": {"reason": reason}, "stderr": "", "raw": ""}
 
         def fake_tmux(argv, timeout=25):
             tmux_calls.append(argv)
             if argv[0] == "codex-latest":
-                return {"ok": True, "rc": 0, "stdout": "thread\tname\tdate\t/path.jsonl", "stderr": "", "argv": ["agent-tmux"] + argv}
+                self.fail("single-ticket supervise must not consult codex-latest")
             if argv[0] == "codex-existing":
                 if len(argv) == 3 and argv[2] == "owner-demo-58":
                     return {"ok": True, "rc": 0, "stdout": "owner-demo-58", "stderr": "", "argv": ["agent-tmux"] + argv}
@@ -1199,8 +1681,13 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("project:demo-alias", message)
 
     def test_supervise_batch_dry_run_reports_route_without_mutations(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[80], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
+        })
         group = {
             "project": "demo",
+            "projects": ["demo"],
             "repo": "/tmp/demo",
             "tickets": [{"id": 80, "title": "Demo", "severity": "p1", "kind": "bug", "column": "New",
                          "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
@@ -1227,6 +1714,41 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("planned", result["groups"][0]["status"])
         self.assertEqual("contact", result["groups"][0]["route"]["mode"])
         self.assertEqual("safe-demo", result["groups"][0]["route"]["session"])
+        tmux.assert_not_called()
+        contact.assert_not_called()
+        audit.assert_not_called()
+        move.assert_not_called()
+
+    def test_supervise_batch_blocks_unbound_contactable_stale_review_lane(self):
+        group = {
+            "project": "demo",
+            "projects": ["demo"],
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 80, "title": "Demo", "severity": "p1", "kind": "bug", "column": "New",
+                         "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "_batch_collect_ticket_groups", return_value=([group], [])), \
+             mock.patch.object(self.cli, "_contactable_providers", return_value=([
+                 {"provider": "codex", "session": "review-demo", "probe": {"ok": True}}
+             ], [])), \
+             mock.patch.object(self.cli, "get_task_in_project", return_value={"id": 80, "title": "Demo", "column_id": 1, "category_id": 1, "is_active": 1}), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "p1"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "category_name", return_value="bug"), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch.object(self.cli, "move_task_to_column") as move, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise_batch({"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(dry_run=True))
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("blocked", result["groups"][0]["status"])
+        self.assertEqual("unbound contactable session", result["groups"][0]["route"]["reason"])
+        self.assertIn("review-demo", result["groups"][0]["route"]["detail"])
         tmux.assert_not_called()
         contact.assert_not_called()
         audit.assert_not_called()
@@ -1302,7 +1824,7 @@ class AgentTicketCliTests(unittest.TestCase):
     def test_supervise_batch_same_owner_reentry_reports_owned_claim_and_plans_route(self):
         self.write_supervision_claims({
             "claim-demo": self.active_supervision_claim(
-                ticket_ids=[80], repo="/tmp/demo", owner_id="test-supervisor"),
+                ticket_ids=[80], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
         })
         group = {
             "project": "demo",
@@ -1434,6 +1956,7 @@ class AgentTicketCliTests(unittest.TestCase):
     def test_supervise_batch_blocks_non_codex_contact_when_codex_session_exists(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
+        supervision_preflight = {"owned_claims": [{"worker_provider": "claude", "worker_session": "safe-claude"}]}
 
         def fake_tmux(argv, timeout=25):
             self.assertEqual("codex-existing", argv[0])
@@ -1445,12 +1968,31 @@ class AgentTicketCliTests(unittest.TestCase):
             {"provider": "codex", "reason": "no tmux-managed codex pane found for /tmp/demo", "probe": {}},
         ])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux) as tmux:
-            route = self.cli._batch_select_route(args, group, "message")
+            route = self.cli._batch_select_route(
+                args, group, "message", supervision_preflight=supervision_preflight)
 
         self.assertEqual("blocked", route["status"])
         self.assertEqual("existing session unsafe", route["reason"])
         self.assertEqual("old-codex", route["session"])
         tmux.assert_called_once()
+
+    def test_supervise_batch_rejects_same_session_wrong_provider_claim_binding(self):
+        group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
+        args = self.batch_args()
+        supervision_preflight = {"owned_claims": [{"worker_provider": "codex", "worker_session": "safe-demo"}]}
+        contactable = [{"provider": "claude", "session": "safe-demo", "probe": {"ok": True}}]
+
+        with mock.patch.object(self.cli, "_contactable_providers", return_value=(contactable, [
+            {"provider": "codex", "reason": "no tmux-managed codex pane found for /tmp/demo", "probe": {}},
+        ])), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux:
+            route = self.cli._batch_select_route(
+                args, group, "message", supervision_preflight=supervision_preflight)
+
+        self.assertEqual("blocked", route["status"])
+        self.assertEqual("unbound contactable session", route["reason"])
+        self.assertIn("claude session safe-demo", route["detail"])
+        tmux.assert_not_called()
 
     def test_supervise_batch_blocks_when_existing_sessions_are_ambiguous(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
@@ -1575,7 +2117,7 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("blocked", route["status"])
         self.assertEqual("agent-tmux existing lookup failed", route["reason"])
 
-    def test_supervise_batch_blocks_empty_successful_latest_lookup(self):
+    def test_supervise_batch_does_not_query_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1588,17 +2130,94 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {"ok": True, "stdout": "", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
-    def test_supervise_batch_blocks_malformed_successful_latest_lookup(self):
+    def test_supervise_batch_does_not_query_latest_when_stale_latest_exists(self):
+        group = {"project": "demo", "repo": "/tmp/demo", "tickets": [], "session_key": "demo"}
+        args = self.batch_args()
+
+        def fake_tmux(argv, timeout=25):
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "rc": 1,
+                    "argv": ["agent-tmux"] + argv,
+                }
+            self.fail("codex-latest is not route authority for fresh launches")
+
+        with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [
+            {"provider": "codex", "reason": "no tmux-managed codex pane found for /tmp/demo", "probe": {}},
+            {"provider": "claude", "reason": "no tmux-managed claude pane found for /tmp/demo", "probe": {}},
+        ])), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
+            route = self.cli._batch_select_route(args, group, "message")
+
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("batch-owner-demo", route["session"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
+        self.assertNotEqual("resume-latest", route["mode"])
+
+    def test_supervise_batch_audit_comment_exposes_resume_latest_skip(self):
+        group = {
+            "project": "demo",
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 97, "title": "One", "severity": "p1", "kind": "bug", "column": "Triaging",
+                         "column_id": 2, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+            "session_key": "demo",
+        }
+        tmux_calls = []
+        audit_messages = []
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "rc": 1,
+                    "argv": ["agent-tmux"] + argv,
+                }
+            if argv[0] == "codex-latest":
+                self.fail("supervise-batch must not consult codex-latest")
+            if argv[0] == "codex":
+                return {"ok": True, "stdout": "launched", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
+            return {"ok": False, "stdout": "", "stderr": "unexpected", "rc": 2, "argv": ["agent-tmux"] + argv}
+
+        with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [
+                 {"provider": "codex", "reason": "no tmux-managed codex pane found for /tmp/demo", "probe": {}},
+                 {"provider": "claude", "reason": "no tmux-managed claude pane found for /tmp/demo", "probe": {}},
+             ])), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "get_task_in_project", return_value={
+                 "id": 97, "title": "One", "column_id": 2, "category_id": 1, "is_active": 1, "swimlane_id": 1,
+             }), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "p1"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "category_name", return_value="bug"), \
+             mock.patch.object(self.cli, "audit_comment", side_effect=lambda cfg, tid, text: audit_messages.append(text)), \
+             mock.patch.object(self.cli, "move_task_to_column"):
+            result = self.cli._batch_route_group(
+                {"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(), group)
+
+        self.assertEqual("routed", result["status"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertIn("resume-latest skipped", audit_messages[0])
+        self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
+
+    def test_supervise_batch_ignores_malformed_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1611,23 +2230,17 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {
-                "ok": True,
-                "stdout": "malformed-success-line-without-tabs",
-                "stderr": "",
-                "rc": 0,
-                "argv": ["agent-tmux"] + argv,
-            }
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
-    def test_supervise_batch_rejects_no_session_text_with_wrong_latest_rc(self):
+    def test_supervise_batch_ignores_wrong_latest_rc_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1640,23 +2253,17 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {
-                "ok": False,
-                "stdout": "",
-                "stderr": "agent-tmux: no Codex session found for workdir: /tmp/demo",
-                "rc": 2,
-                "argv": ["agent-tmux"] + argv,
-            }
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
-    def test_supervise_batch_rejects_no_latest_session_text_for_wrong_repo(self):
+    def test_supervise_batch_ignores_wrong_repo_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1669,23 +2276,17 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {
-                "ok": False,
-                "stdout": "",
-                "stderr": "agent-tmux: no Codex session found for workdir: /tmp/other",
-                "rc": 1,
-                "argv": ["agent-tmux"] + argv,
-            }
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
-    def test_supervise_batch_blocks_latest_success_with_extra_line(self):
+    def test_supervise_batch_ignores_latest_success_with_extra_line(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1698,23 +2299,17 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {
-                "ok": True,
-                "stdout": "Thread\tid\t2026-05-12T00:00:00Z\t/tmp/session.jsonl\nwarning",
-                "stderr": "",
-                "rc": 0,
-                "argv": ["agent-tmux"] + argv,
-            }
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
-    def test_supervise_batch_blocks_latest_success_with_stderr_warning(self):
+    def test_supervise_batch_ignores_latest_success_with_stderr_warning(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args()
 
@@ -1727,21 +2322,15 @@ class AgentTicketCliTests(unittest.TestCase):
                     "rc": 1,
                     "argv": ["agent-tmux"] + argv,
                 }
-            self.assertEqual("codex-latest", argv[0])
-            return {
-                "ok": True,
-                "stdout": "Thread\tid\t2026-05-12T00:00:00Z\t/tmp/session.jsonl",
-                "stderr": "warning: stale index",
-                "rc": 0,
-                "argv": ["agent-tmux"] + argv,
-            }
+            self.fail("codex-latest is not route authority for fresh launches")
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
              mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux):
             route = self.cli._batch_select_route(args, group, "message")
 
-        self.assertEqual("blocked", route["status"])
-        self.assertEqual("agent-tmux latest lookup failed", route["reason"])
+        self.assertEqual("planned", route["status"])
+        self.assertEqual("launch", route["mode"])
+        self.assertEqual("skipped", route["resume_latest"]["status"])
 
     def test_supervise_batch_blocks_cross_provider_unsafe_refusal_before_contact(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
@@ -1815,13 +2404,20 @@ class AgentTicketCliTests(unittest.TestCase):
     def test_supervise_batch_explicit_provider_blocks_other_contactable_lane(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
         args = self.batch_args(provider="codex")
+        supervision_preflight = {
+            "owned_claims": [
+                {"worker_provider": "codex", "worker_session": "safe-codex"},
+                {"worker_provider": "claude", "worker_session": "safe-claude"},
+            ]
+        }
         contactable = [
             {"provider": "codex", "session": "safe-codex", "probe": {"ok": True}},
             {"provider": "claude", "session": "safe-claude", "probe": {"ok": True}},
         ]
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=(contactable, [])):
-            route = self.cli._batch_select_route(args, group, "message")
+            route = self.cli._batch_select_route(
+                args, group, "message", supervision_preflight=supervision_preflight)
 
         self.assertEqual("blocked", route["status"])
         self.assertEqual("provider conflict", route["reason"])
@@ -1847,13 +2443,7 @@ class AgentTicketCliTests(unittest.TestCase):
                     "argv": ["agent-tmux"] + argv,
                 }
             if argv[0] == "codex-latest":
-                return {
-                    "ok": False,
-                    "stdout": "",
-                    "stderr": "agent-tmux: no Codex session found for workdir: /tmp/demo",
-                    "rc": 1,
-                    "argv": ["agent-tmux"] + argv,
-                }
+                self.fail("supervise-batch must not consult codex-latest")
             return {"ok": True, "stdout": "launched", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
@@ -1897,13 +2487,7 @@ class AgentTicketCliTests(unittest.TestCase):
                     }
                 return {"ok": True, "stdout": "new-owner-demo", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
             if argv[0] == "codex-latest":
-                return {
-                    "ok": False,
-                    "stdout": "",
-                    "stderr": "agent-tmux: no Codex session found for workdir: /tmp/demo",
-                    "rc": 1,
-                    "argv": ["agent-tmux"] + argv,
-                }
+                self.fail("supervise-batch must not consult codex-latest")
             return {"ok": True, "stdout": "launched", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
 
         with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [])), \
@@ -1920,13 +2504,17 @@ class AgentTicketCliTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["status"])
         self.assertEqual("existing session appeared before launch", result["route"]["reason"])
-        self.assertEqual(["codex-existing", "codex-latest", "codex-existing", "codex-latest", "codex-existing"],
-                         [call[0] for call in tmux_calls])
+        self.assertEqual(["codex-existing", "codex-existing", "codex-existing"], [call[0] for call in tmux_calls])
         self.assertNotIn("codex", [call[0] for call in tmux_calls])
 
     def test_supervise_batch_contacts_one_worker_for_same_repo_queue(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[82, 83], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
+        })
         group = {
             "project": "demo",
+            "projects": ["demo"],
             "repo": "/tmp/demo",
             "tickets": [
                 {"id": 82, "title": "First", "severity": "p1", "kind": "bug", "column": "New",
@@ -2002,6 +2590,10 @@ class AgentTicketCliTests(unittest.TestCase):
         move.assert_not_called()
 
     def test_supervise_batch_revalidates_before_send_and_blocks_needs_human_race(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[88], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
+        })
         group = {
             "project": "demo",
             "repo": "/tmp/demo",
@@ -2037,6 +2629,10 @@ class AgentTicketCliTests(unittest.TestCase):
         move.assert_not_called()
 
     def test_supervise_batch_revalidates_before_move_and_does_not_move_human_ticket(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[89], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
+        })
         group = {
             "project": "demo",
             "repo": "/tmp/demo",
@@ -2074,6 +2670,10 @@ class AgentTicketCliTests(unittest.TestCase):
         move.assert_not_called()
 
     def test_supervise_batch_move_failure_marks_post_route_blocked(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                ticket_ids=[90], repo="/tmp/demo", owner_id="test-supervisor", worker_session="safe-demo"),
+        })
         group = {
             "project": "demo",
             "repo": "/tmp/demo",
