@@ -887,7 +887,7 @@ class AgentTicketCliTests(unittest.TestCase):
                     "ok": False,
                     "rc": 1,
                     "stdout": "",
-                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo; session: owner-demo-53",
                     "argv": ["agent-tmux"] + argv,
                 }
             if argv[0] == "codex-latest":
@@ -1091,7 +1091,7 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
         audit.assert_not_called()
 
-    def test_supervise_send_refusal_reports_dry_run_session_context(self):
+    def test_supervise_blocks_codex_starter_placeholder_probe_before_live_send(self):
         task = {"id": 70, "title": "Fix routing mismatch", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         contact_calls = []
 
@@ -1154,15 +1154,11 @@ class AgentTicketCliTests(unittest.TestCase):
 
         result = json.loads(out.getvalue())
         self.assertFalse(result["ok"])
-        self.assertEqual("send refused", result["reason"])
-        self.assertIn("guarded dry-run accepted codex session owner-agent-tickets", result["detail"])
-        self.assertIn("status=would_send", result["detail"])
-        self.assertIn("live send refused", result["detail"])
+        self.assertEqual("unsafe provider refusal", result["reason"])
         self.assertIn("codex starter placeholder has no pending user text", result["detail"])
-        self.assertEqual("owner-agent-tickets", result["route"]["session"])
-        self.assertEqual("would_send", result["contact_probe"]["json"]["status"])
+        self.assertIn("owner-agent-tickets", result["detail"])
         self.assertIn(("codex", True, "owner-agent-tickets"), contact_calls)
-        self.assertIn(("codex", False, "owner-agent-tickets"), contact_calls)
+        self.assertNotIn(("codex", False, "owner-agent-tickets"), contact_calls)
         tmux.assert_not_called()
         audit.assert_not_called()
 
@@ -2369,6 +2365,18 @@ class AgentTicketCliTests(unittest.TestCase):
 
         self.assertEqual("blocked", route["status"])
         self.assertEqual("agent-tmux existing lookup failed", route["reason"])
+
+    def test_codex_existing_absence_rejects_wrong_requested_session_suffix(self):
+        result = {
+            "ok": False,
+            "stdout": "",
+            "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo; session: other-demo",
+            "rc": 1,
+            "argv": ["agent-tmux", "codex-existing", "/tmp/demo", "owner-demo-53"],
+        }
+
+        self.assertFalse(self.cli._batch_codex_existing_is_absent(result, "/tmp/demo", "owner-demo-53"))
+        self.assertTrue(self.cli._batch_codex_existing_is_absent(result, "/tmp/demo", "other-demo"))
 
     def test_supervise_batch_does_not_query_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}

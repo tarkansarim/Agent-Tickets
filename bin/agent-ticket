@@ -1931,10 +1931,31 @@ def _probe_reason(r):
     return reason or "unknown"
 
 
-def _classify_probe(r):
+def _probe_reason_with_default(r, default_reason):
+    payload = dict(r.get("json") or {})
+    payload.setdefault("reason", default_reason)
+    enriched = dict(r)
+    enriched["json"] = payload
+    return _probe_reason(enriched)
+
+
+def _codex_starter_placeholder_probe(r, provider):
+    if provider != "codex" or not r.get("ok"):
+        return False
+    payload = r.get("json") if isinstance(r.get("json"), dict) else {}
+    return (
+        str(payload.get("status") or "").lower() == "would_send"
+        and str(payload.get("pane_state") or "").lower() == "idle_empty_prompt"
+    )
+
+
+def _classify_probe(r, provider=None):
     """From a `_agent_contact(..., dry_run=True)` result, decide if this provider
     has a contactable session. Returns ("ok", session_name_or_None) or ("no", reason).
-    Trusts rc==0 = contactable (agent-contact refuses with a non-zero rc)."""
+    Trusts rc==0 = contactable except for known non-sendable Codex starter placeholder state."""
+    # DELICATE_FIX: Carefully debugged. Modify only with failing repro + targeted tests.
+    if _codex_starter_placeholder_probe(r, provider):
+        return ("no", _probe_reason_with_default(r, "codex starter placeholder has no pending user text"))
     if r.get("ok"):
         sess = (r.get("json") or {}).get("session")
         return ("ok", sess)   # sess may be None — the real send will re-discover
@@ -2498,25 +2519,41 @@ def _batch_tmux_text(result):
     return ("%s\n%s" % (result.get("stdout", ""), result.get("stderr", ""))).strip()
 
 
-def _batch_absence_workdir_matches(line, prefix, expected_repo=None):
-    if not line.startswith(prefix):
+def _batch_parse_codex_absence(line):
+    match = re.match(
+        r"^agent-tmux: no Codex tmux session found for workdir:\s*(?P<repo>.+?)(?:;\s*session:\s*(?P<session>.+))?$",
+        line or "",
+    )
+    if not match:
+        return None
+    session = match.group("session")
+    if session is not None:
+        session = session.strip().strip("'\"") or None
+    return {"repo": match.group("repo").strip(), "session": session}
+
+
+def _batch_absence_workdir_matches(line, expected_repo=None, expected_session=None):
+    parsed = _batch_parse_codex_absence(line)
+    if not parsed:
         return False
-    if expected_repo is None:
-        return True
-    reported = line[len(prefix):].strip()
-    return os.path.realpath(os.path.expanduser(reported)) == os.path.realpath(os.path.expanduser(str(expected_repo)))
+    if expected_repo is not None:
+        reported = parsed["repo"]
+        if os.path.realpath(os.path.expanduser(reported)) != os.path.realpath(os.path.expanduser(str(expected_repo))):
+            return False
+    if expected_session is not None and parsed.get("session") and parsed["session"] != expected_session:
+        return False
+    return True
 
 
-def _batch_codex_existing_is_absent(result, expected_repo=None):
+def _batch_codex_existing_is_absent(result, expected_repo=None, expected_session=None):
     if result.get("ok"):
         return False
     stderr_lines = (result.get("stderr") or "").strip().splitlines()
-    prefix = "agent-tmux: no Codex tmux session found for workdir:"
     return bool(
         int(result.get("rc") or 0) == 1
         and not (result.get("stdout") or "").strip()
         and len(stderr_lines) == 1
-        and _batch_absence_workdir_matches(stderr_lines[0], prefix, expected_repo)
+        and _batch_absence_workdir_matches(stderr_lines[0], expected_repo, expected_session)
     )
 
 
@@ -3340,7 +3377,7 @@ def _contactable_providers(repo, message, session=None, providers=None):
     contactable, refused = [], []
     for provider in providers:
         result = _agent_contact(repo, provider, message, dry_run=True, session=session)
-        kind, info = _classify_probe(result)
+        kind, info = _classify_probe(result, provider=provider)
         if kind == "ok":
             contactable.append({"provider": provider, "session": info, "probe": result})
         else:
@@ -3455,7 +3492,7 @@ def cmd_supervise(cfg, args):
         existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
         if _tmux_stdout_is_exact_session(existing or {}, session):
             exact_probe = _agent_contact(repo, "codex", message, dry_run=True, session=session)
-            kind, info = _classify_probe(exact_probe)
+            kind, info = _classify_probe(exact_probe, provider="codex")
             if kind == "ok":
                 selected = {
                     "provider": "codex",
@@ -3493,7 +3530,7 @@ def cmd_supervise(cfg, args):
                 result.update({"existing_ticket_session": existing})
                 out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
                 return
-            if not _batch_codex_existing_is_absent(existing or {}, repo):
+            if not _batch_codex_existing_is_absent(existing or {}, repo, session):
                 result = _supervision_blocked(
                     cfg, args, "agent-tmux existing lookup failed",
                     _batch_tmux_failure_detail(existing or {}),
@@ -3804,7 +3841,7 @@ def cmd_dispatch(cfg, args, return_dict=False):
     message = _dispatch_message(cfg, args.id, pname, title)
     contactable, not_reasons = [], []
     for prov in DISPATCH_PROVIDERS:
-        kind, info = _classify_probe(_agent_contact(repo, prov, message, dry_run=True))
+        kind, info = _classify_probe(_agent_contact(repo, prov, message, dry_run=True), provider=prov)
         (contactable.append((prov, info)) if kind == "ok" else not_reasons.append("%s: %s" % (prov, info)))
     if not contactable:
         m = ("dispatch: no contactable owner agent for project:%s — %s. Ticket left in '%s' (the notify hook will "
