@@ -1949,12 +1949,13 @@ def _codex_starter_placeholder_probe(r, provider):
     )
 
 
-def _classify_probe(r, provider=None):
+def _classify_probe(r, provider=None, accept_idle_would_send=False):
     """From a `_agent_contact(..., dry_run=True)` result, decide if this provider
     has a contactable session. Returns ("ok", session_name_or_None) or ("no", reason).
-    Trusts rc==0 = contactable except for known non-sendable Codex starter placeholder state."""
+    Trusts rc==0 = contactable except for known non-sendable Codex starter placeholder state
+    outside exact-session supervise probes."""
     # DELICATE_FIX: Carefully debugged. Modify only with failing repro + targeted tests.
-    if _codex_starter_placeholder_probe(r, provider):
+    if _codex_starter_placeholder_probe(r, provider) and not accept_idle_would_send:
         return ("no", _probe_reason_with_default(r, "codex starter placeholder has no pending user text"))
     if r.get("ok"):
         sess = (r.get("json") or {}).get("session")
@@ -3372,12 +3373,16 @@ def _supervision_blocked(cfg, args, reason, detail, original_id=None):
     return {"ok": False, "status": "blocked", "reason": reason, "detail": detail, "tool_ticket": blocker_id}
 
 
-def _contactable_providers(repo, message, session=None, providers=None):
+def _contactable_providers(repo, message, session=None, providers=None, accept_idle_would_send=False):
     providers = providers or DISPATCH_PROVIDERS
     contactable, refused = [], []
     for provider in providers:
         result = _agent_contact(repo, provider, message, dry_run=True, session=session)
-        kind, info = _classify_probe(result, provider=provider)
+        kind, info = _classify_probe(
+            result,
+            provider=provider,
+            accept_idle_would_send=bool(accept_idle_would_send and session),
+        )
         if kind == "ok":
             contactable.append({"provider": provider, "session": info, "probe": result})
         else:
@@ -3419,7 +3424,13 @@ def cmd_supervise(cfg, args):
     message = _supervision_message(cfg, args.id, pname, title, args)
     requested_provider = args.provider
     session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
-    contactable_all, refused = _contactable_providers(repo, message, session=args.session, providers=DISPATCH_PROVIDERS)
+    contactable_all, refused = _contactable_providers(
+        repo,
+        message,
+        session=args.session,
+        providers=DISPATCH_PROVIDERS,
+        accept_idle_would_send=True,
+    )
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
 
@@ -3492,7 +3503,7 @@ def cmd_supervise(cfg, args):
         existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
         if _tmux_stdout_is_exact_session(existing or {}, session):
             exact_probe = _agent_contact(repo, "codex", message, dry_run=True, session=session)
-            kind, info = _classify_probe(exact_probe, provider="codex")
+            kind, info = _classify_probe(exact_probe, provider="codex", accept_idle_would_send=True)
             if kind == "ok":
                 selected = {
                     "provider": "codex",
