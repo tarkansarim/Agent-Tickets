@@ -2500,10 +2500,23 @@ def _batch_contact_absence_repo(reason):
     return match.group(1).strip() if match else None
 
 
-def _batch_refusal_is_safe_absence(refusal, expected_repo=None):
+def _contact_missing_window_session(reason):
+    match = re.search(
+        r"\btmux pane discovery failed:\s*can't find window:\s*(?P<session>.+?)\s*$",
+        reason or "",
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group("session").strip().strip("'\"") or None
+
+
+def _batch_refusal_is_safe_absence(refusal, expected_repo=None, expected_session=None):
     probe = refusal.get("probe") or {}
     payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
     reason = str(refusal.get("reason") or payload.get("reason") or payload.get("pane_reason") or probe.get("stderr") or "")
+    if expected_session is not None and _contact_missing_window_session(reason) == str(expected_session):
+        return True
     reported_repo = _batch_contact_absence_repo(reason)
     if not reported_repo:
         return False
@@ -2512,8 +2525,8 @@ def _batch_refusal_is_safe_absence(refusal, expected_repo=None):
     return os.path.realpath(os.path.expanduser(reported_repo)) == os.path.realpath(os.path.expanduser(str(expected_repo)))
 
 
-def _batch_unsafe_contact_refusals(refusals, expected_repo=None):
-    return [r for r in refusals if not _batch_refusal_is_safe_absence(r, expected_repo)]
+def _batch_unsafe_contact_refusals(refusals, expected_repo=None, expected_session=None):
+    return [r for r in refusals if not _batch_refusal_is_safe_absence(r, expected_repo, expected_session)]
 
 
 def _batch_tmux_text(result):
@@ -3434,7 +3447,7 @@ def cmd_supervise(cfg, args):
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
 
-    unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo)
+    unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo, expected_session=args.session)
     if unsafe_refusals:
         result = _supervision_blocked(
             cfg, args, "unsafe provider refusal",

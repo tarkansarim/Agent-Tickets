@@ -924,6 +924,65 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-53"]], tmux_calls)
         audit.assert_not_called()
 
+    def test_supervise_explicit_missing_tmux_window_launches_without_unsafe_refusal(self):
+        task = {"id": 55, "title": "Fix absent exact tmux window", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {
+                    "reason": "tmux pane discovery failed: can't find window: owner-demo-55"
+                },
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo; session: owner-demo-55",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            if argv[0] == "codex-latest":
+                self.fail("single-ticket supervise must not consult codex-latest")
+            self.fail("dry-run should not launch")
+
+        args = argparse.Namespace(
+            id=55, provider="codex", session="owner-demo-55", session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("owner-demo-55", result["route"]["session"])
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-55"]], tmux_calls)
+        audit.assert_not_called()
+
     def test_supervise_reuses_existing_ticket_session_through_guarded_contact(self):
         task = {"id": 58, "title": "Fix demo", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         tmux_calls = []
@@ -2441,6 +2500,17 @@ class AgentTicketCliTests(unittest.TestCase):
 
         self.assertFalse(self.cli._batch_codex_existing_is_absent(result, "/tmp/demo", "owner-demo-53"))
         self.assertTrue(self.cli._batch_codex_existing_is_absent(result, "/tmp/demo", "other-demo"))
+
+    def test_contact_missing_window_absence_requires_exact_requested_session(self):
+        refusal = {
+            "provider": "codex",
+            "reason": "tmux pane discovery failed: can't find window: owner-demo-53",
+            "probe": {"json": {"reason": "tmux pane discovery failed: can't find window: owner-demo-53"}},
+        }
+
+        self.assertFalse(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo"))
+        self.assertFalse(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo", "other-demo"))
+        self.assertTrue(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo", "owner-demo-53"))
 
     def test_supervise_batch_does_not_query_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}
