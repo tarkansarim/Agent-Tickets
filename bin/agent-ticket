@@ -3440,14 +3440,14 @@ def cmd_supervise(cfg, args):
     contactable_all, refused = _contactable_providers(
         repo,
         message,
-        session=args.session,
+        session=session,
         providers=DISPATCH_PROVIDERS,
         accept_idle_would_send=True,
     )
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
 
-    unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo, expected_session=args.session)
+    unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo, expected_session=session)
     if unsafe_refusals:
         result = _supervision_blocked(
             cfg, args, "unsafe provider refusal",

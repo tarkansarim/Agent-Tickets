@@ -1046,11 +1046,13 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn(("codex", False, "owner-demo-58"), contact_calls)
         self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
 
-    def test_supervise_accepts_auto_discovered_default_ticket_session(self):
-        task = {"id": 59, "title": "Fix auto-discovered", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+    def test_supervise_accepts_default_ticket_session(self):
+        task = {"id": 59, "title": "Fix default ticket session", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        contact_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
-            if provider == "codex" and session is None:
+            contact_calls.append((provider, dry_run, session))
+            if provider == "codex" and session == "owner-demo-59":
                 return {
                     "ok": True,
                     "rc": 0,
@@ -1093,7 +1095,83 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("contact", result["route"]["mode"])
         self.assertEqual("owner-demo-59", result["route"]["session"])
+        self.assertIn(("codex", True, "owner-demo-59"), contact_calls)
+        self.assertNotIn(("codex", True, None), contact_calls)
         tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_default_ticket_session_ignores_untrusted_unrelated_repo_panes_when_exact_session_absent(self):
+        task = {"id": 98, "title": "Fix Rewind", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        contact_calls = []
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            contact_calls.append((provider, dry_run, session))
+            if session is None:
+                return {
+                    "ok": False,
+                    "rc": 3,
+                    "json": {
+                        "reason": (
+                            "candidate codex pane found for /tmp/Rewind, but provider root or "
+                            "launcher root is not trusted; session=owner-Rewind pane_id=%36"
+                        )
+                    },
+                    "stderr": "",
+                    "raw": "",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {
+                    "reason": "no tmux-managed %s pane found for /tmp/Rewind in session 'owner-Rewind-98'" % provider
+                },
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/Rewind; session: owner-Rewind-98",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            self.fail("dry-run should not launch")
+
+        args = argparse.Namespace(
+            id=98, provider=None, session=None, session_prefix="owner", full_permission=True,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:Rewind"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("Rewind", "/tmp/Rewind")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["dry_run"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("owner-Rewind-98", result["route"]["session"])
+        self.assertEqual([("codex", True, "owner-Rewind-98"), ("claude", True, "owner-Rewind-98")], contact_calls)
+        self.assertEqual([["codex-existing", "/tmp/Rewind", "owner-Rewind-98"]], tmux_calls)
         audit.assert_not_called()
 
     def test_supervise_blocks_existing_ticket_session_when_guarded_contact_refuses(self):
