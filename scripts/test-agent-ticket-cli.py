@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -343,6 +344,61 @@ class AgentTicketCliTests(unittest.TestCase):
             check=True,
         )
         self.assertEqual("", codex_stop.stdout)
+
+    def test_notify_hook_baseline_does_not_reopen_stdout_path(self):
+        home = pathlib.Path(self.tmpdir.name) / "home"
+        cli_dir = home / ".local" / "bin"
+        cli_dir.mkdir(parents=True)
+        fake_cli = cli_dir / "agent-ticket"
+        fake_cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if sys.argv[1:4] == ['list', '--project', 'agent-tickets'] and sys.argv[4:] == ['--json']:\n"
+            "    print(json.dumps([{'id': 125, 'title': 'Hook stdout', 'tags': ['project:agent-tickets'], 'url': 'u'}]))\n"
+            "elif sys.argv[1:4] == ['callbacks', '--pending', '--repo']:\n"
+            "    pass\n"
+        )
+        fake_cli.chmod(0o755)
+        work = pathlib.Path(self.tmpdir.name) / "agent-tickets"
+        work.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "XDG_CACHE_HOME": str(pathlib.Path(self.tmpdir.name) / "cache-socket-stdout"),
+        }
+        hook = ROOT / "scripts" / "notify-hook.sh"
+        parent_sock, child_sock = socket.socketpair()
+        try:
+            proc = subprocess.run(
+                [str(hook), "baseline"],
+                cwd=str(work),
+                env=env,
+                stdout=child_sock,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+        finally:
+            child_sock.close()
+
+        chunks = []
+        parent_sock.settimeout(1)
+        try:
+            while True:
+                chunk = parent_sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+        finally:
+            parent_sock.close()
+
+        stdout = b"".join(chunks).decode("utf-8")
+        self.assertEqual("", proc.stderr)
+        self.assertIn("Open agent-ticket(s)", stdout)
+        self.assertIn("#125", stdout)
 
     def test_register_hooks_replaces_old_codex_stop_notify_command(self):
         home = pathlib.Path(self.tmpdir.name) / "home"

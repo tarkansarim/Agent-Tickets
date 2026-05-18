@@ -37,11 +37,8 @@ SEEN="$CACHE_DIR/seen-$SAFE_REPO.json"
 JSON="$("$CLI" list --project "$REPO" --json 2>/dev/null)" || JSON=""
 
 if [ -n "$JSON" ]; then
-PY_STDOUT="/dev/stdout"
-if [ "$OUTPUT_MODE" = "codex-stop" ]; then
-  PY_STDOUT="/dev/null"
-fi
-AGENT_TICKETS_JSON="$JSON" AT_MODE="$MODE" AT_REPO="$REPO" AT_SEEN="$SEEN" python3 <<'PY' >"$PY_STDOUT" || true
+render_ticket_notice() {
+AGENT_TICKETS_JSON="$JSON" AT_MODE="$MODE" AT_REPO="$REPO" AT_SEEN="$SEEN" python3 <<'PY'
 import json, os, sys
 mode = os.environ.get("AT_MODE", "changes")
 repo = os.environ.get("AT_REPO", "")
@@ -86,6 +83,12 @@ for tid in show_ids:
     print("  #%-4s %s%s   %s" % (tid, t.get("title", ""), extra, t.get("url", "")))
 print("  (`agent-ticket show <id>` for details; if you OWN this repo, fix in place and `agent-ticket close <id>`.)")
 PY
+}
+if [ "$OUTPUT_MODE" = "codex-stop" ]; then
+  render_ticket_notice >/dev/null || true
+else
+  render_ticket_notice || true
+fi
 fi
 
 if [ "$OUTPUT_MODE" != "codex-stop" ]; then
