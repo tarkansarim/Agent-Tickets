@@ -1,11 +1,17 @@
 ---
 name: agent-tickets
-description: "File and manage tickets in the local Kanboard board for problems agents hit while USING the user's apps/tools (crashes, wrong behavior, broken CLI flags, bad docs, harness/runtime misbehavior, friction). FILE a ticket if your job is to report findings back (test/QA/review/exploration worker); if you OWN the project and can fix it now, just fix it — don't file — but do read/triage/close tickets others filed for you. You can also dispatch a filed ticket to the owning repo's agent. NOT for development backlog, feature planning, or your in-flight TODO. Triggers — file a ticket, report this issue, open a ticket, log this for later, check the ticket board, dispatch a ticket to its owner agent, a test subagent reporting back, an agent blocked while running/using something."
+description: "Use for local agent-ticket Kanboard workflows: file/report/open/log tickets, check/list/show open tickets, dispatch or supervise owner agents, closeout-check tickets, and callbacks."
 ---
 
 # Agent Tickets
 
 A **local Kanboard** at **http://localhost:8765** is the shared queue for problems AI agents run into **while using the user's apps, tools, CLIs, and harnesses**. The user triages tickets in that web UI; agents file and update them via the `agent-ticket` CLI. (Local only — no cloud, no account, no git. Data in `~/kanboard-data/`.)
+
+## Discovery Triggers
+
+Load this skill when the user or current task asks to file, report, open, log, check, list, show, dispatch, supervise, closeout-check, close, reopen, route, drain, or callback an agent ticket. Also load it for test/report-mode subagents, owner-agent ticket inbox work, local Kanboard ticket board checks, and agent-contact/tmux ticket supervision handoffs.
+
+Representative routes: `agent-ticket new`, `agent-ticket list`, `agent-ticket dispatch <id>`, `agent-ticket supervise <id>`, `agent-ticket closeout-check <id>`, and `agent-ticket callbacks`.
 
 ## What this board IS for
 

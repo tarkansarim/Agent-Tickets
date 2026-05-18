@@ -1975,6 +1975,47 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertTrue(info["installed_claude_skill_matches_source"])
         self.assertTrue(info["installed_notify_hook_matches_source"])
 
+    def test_skill_frontmatter_description_is_compact_discovery_only(self):
+        text = (ROOT / "skill" / "SKILL.md").read_text()
+        parts = text.split("---", 2)
+        self.assertEqual(3, len(parts))
+        frontmatter = parts[1]
+        body = parts[2]
+        description_line = next(
+            line for line in frontmatter.splitlines()
+            if line.startswith("description: ")
+        )
+        description = description_line.split(":", 1)[1].strip().strip('"')
+        lowered = description.lower()
+
+        self.assertLessEqual(len(description), 220)
+        for term in (
+            "agent-ticket",
+            "file",
+            "check",
+            "dispatch",
+            "supervise",
+            "closeout-check",
+            "callback",
+        ):
+            self.assertIn(term, lowered)
+        for deferred_detail in (
+            "if you own",
+            "development backlog",
+            "test/qa/review",
+            "agent blocked while running",
+        ):
+            self.assertNotIn(deferred_detail, lowered)
+        for body_detail in (
+            "## Discovery Triggers",
+            "## Who files vs. who consumes",
+            "## Dispatching a filed ticket to its owner agent",
+            "agent-ticket supervise 42 --full-permission",
+            "agent-ticket closeout-check 42 --strict",
+            "agent-ticket callbacks --pending --repo <repo>",
+        ):
+            self.assertIn(body_detail, body)
+
     def test_install_help_and_unknown_args_exit_before_side_effects(self):
         with tempfile.TemporaryDirectory() as home:
             help_result = subprocess.run(
