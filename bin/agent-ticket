@@ -2413,6 +2413,24 @@ def _supervision_message(cfg, task_id, pname, title, args):
     )
 
 
+def _supervision_contact_message(cfg, task_id, pname, title, args):
+    extra = ("\n\nSupervisor note:\n%s" % args.message) if args.message else ""
+    return _san(
+        "Ticket #%d for project %s: %s\n"
+        "Use `agent-ticket show %d` for full title/body. If taking it, move to "
+        "'Agent working', work from SOURCE, validate exact request, comment evidence, "
+        "run `agent-ticket closeout-check %d --strict`, then close.%s"
+        % (
+            int(task_id),
+            pname,
+            web_url(cfg, "task/%d" % int(task_id)),
+            int(task_id),
+            int(task_id),
+            extra,
+        )
+    )
+
+
 def _resume_latest_skipped():
     return {
         "status": "skipped",
@@ -3434,12 +3452,13 @@ def cmd_supervise(cfg, args):
         out(args, result, "supervise #%s blocked: already supervised (%s)" % (args.id, result["detail"]))
         return
 
-    message = _supervision_message(cfg, args.id, pname, title, args)
+    launch_message = _supervision_message(cfg, args.id, pname, title, args)
+    contact_message = _supervision_contact_message(cfg, args.id, pname, title, args)
     requested_provider = args.provider
     session = args.session or _supervise_launch_session_name(args.session_prefix, pname, args.id)
     contactable_all, refused = _contactable_providers(
         repo,
-        message,
+        contact_message,
         session=session,
         providers=DISPATCH_PROVIDERS,
         accept_idle_would_send=True,
@@ -3515,7 +3534,7 @@ def cmd_supervise(cfg, args):
         provider = "codex"
         existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
         if _tmux_stdout_is_exact_session(existing or {}, session):
-            exact_probe = _agent_contact(repo, "codex", message, dry_run=True, session=session)
+            exact_probe = _agent_contact(repo, "codex", contact_message, dry_run=True, session=session)
             kind, info = _classify_probe(exact_probe, provider="codex", accept_idle_would_send=True)
             if kind == "ok":
                 selected = {
@@ -3611,7 +3630,7 @@ def cmd_supervise(cfg, args):
         route["watcher"] = watcher
 
     if selected["mode"] == "contact":
-        send = _agent_contact(repo, selected["provider"], message, dry_run=False, session=route.get("session"))
+        send = _agent_contact(repo, selected["provider"], contact_message, dry_run=False, session=route.get("session"))
         if not send.get("ok"):
             _release_supervision_claim(claim_id)
             result = _supervision_blocked(
@@ -3639,7 +3658,7 @@ def cmd_supervise(cfg, args):
         cmd = ["codex", route["session"], repo]
         if args.full_permission:
             cmd += ["-s", "danger-full-access", "-a", "never"]
-        cmd.append(message)
+        cmd.append(launch_message)
         launch = _agent_tmux(cmd, timeout=60)
         route["launch"] = launch
         if not launch.get("ok"):

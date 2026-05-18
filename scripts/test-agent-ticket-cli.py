@@ -1363,6 +1363,103 @@ class AgentTicketCliTests(unittest.TestCase):
         tmux.assert_not_called()
         audit.assert_not_called()
 
+    def test_supervise_contact_uses_compact_message_for_claude_live_send(self):
+        task = {
+            "id": 115,
+            "title": "Compact ComfyCommander router description while preserving deferred references",
+            "column_id": 2,
+            "swimlane_id": 1,
+            "is_active": 1,
+        }
+        contact_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            contact_calls.append((provider, dry_run, session, message))
+            if provider == "claude" and session == "owner-demo-115-claude":
+                if dry_run:
+                    return {
+                        "ok": True,
+                        "rc": 0,
+                        "json": {
+                            "status": "would_send",
+                            "session": "owner-demo-115-claude",
+                            "pane_state": "idle_empty_prompt",
+                        },
+                        "stderr": "",
+                        "raw": "{}",
+                    }
+                if len(message) > 420:
+                    return {
+                        "ok": False,
+                        "rc": 2,
+                        "json": {
+                            "status": "mutated_unsubmitted",
+                            "stage": "submit",
+                            "reason": (
+                                "pre-submit revalidation failed after paste; target composer may contain "
+                                "an unsubmitted message: full guarded contact line or exact Codex "
+                                "pasted-content placeholder is not the current composer prompt body"
+                            ),
+                            "session": "owner-demo-115-claude",
+                            "pane_state": "pending_user_text",
+                        },
+                        "stderr": "",
+                        "raw": "{}",
+                    }
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "json": {"status": "sent", "session": "owner-demo-115-claude"},
+                    "stderr": "",
+                    "raw": "{}",
+                }
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {
+                    "reason": "no tmux-managed %s pane found for /tmp/demo in session 'owner-demo-115-claude'" % provider
+                },
+                "stderr": "",
+                "raw": "",
+            }
+
+        args = argparse.Namespace(
+            id=115, provider="claude", session="owner-demo-115-claude", session_prefix="owner",
+            full_permission=False, message="", dry_run=False, no_tool_ticket=True,
+            poll_interval=0, max_polls=0, strict_closeout=False, require_clean=False,
+            require_validation=False, require_commit=False, require_install=False, json=True,
+            watch_origin=False, supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("routed", result["status"])
+        claude_messages = [call[3] for call in contact_calls if call[0] == "claude"]
+        self.assertEqual(2, len(claude_messages))
+        self.assertTrue(all(len(message) <= 420 for message in claude_messages))
+        self.assertTrue(all("agent-ticket show 115" in message for message in claude_messages))
+        self.assertTrue(all("Closeout gate before" not in message for message in claude_messages))
+        self.assertEqual("contact", result["route"]["mode"])
+        self.assertEqual("claude", result["route"]["provider"])
+        self.assertEqual("owner-demo-115-claude", result["route"]["session"])
+        tmux.assert_not_called()
+        audit.assert_called_once()
+
     def test_register_origin_watcher_persists_metadata_and_audit_comment(self):
         args = argparse.Namespace(
             watch_origin=True,
