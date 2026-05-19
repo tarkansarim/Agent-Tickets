@@ -141,6 +141,8 @@ Ticket #51 added a durable local claim layer so a second supervisor can see that
 - `agent-ticket supervise` and `agent-ticket supervise-batch` check active claims before normal route planning and acquire/update a claim after route selection but before any real `agent-contact` send, `agent-tmux` launch, ticket comment, or ticket move. Same-owner reentry is allowed via `--supervisor-id` or `AGENT_TICKETS_SUPERVISOR_ID`; active other-owner claims for the same repo or overlapping tickets fail closed with `already supervised` unless `--force-supervision` is explicit.
 - Routed supervisors heartbeat the claim while polling. When all routed tickets close or move to `Needs human`, the claim is released. If the supervisor exits while tickets remain open or is interrupted, the claim remains visible until expiry and can be recovered explicitly.
 - `agent-ticket supervision status|release|adopt|steal` is the recovery surface. Status lists active and stale claims; release/adopt/steal require a claim/repo/ticket/all filter and only act on claims owned by the current supervisor or stale claims unless `--force` is supplied.
+- Default process-bound owners use `owner_id=pid:<host>:<pid>`. For claims from this host, a dead owner PID makes the claim stale immediately, so later `supervise`/`supervise-batch` calls do not wait for TTL or require `--force-supervision`; explicit stable `--supervisor-id` claims remain TTL/recovery based.
+- Codex `idle_empty_prompt` starter placeholders are not treated as contactable even when guarded dry-run reports `would_send`. Supervision revalidates the exact session and blocks before live send rather than creating a dry-run/live mismatch.
 
 ## Open / possible follow-ups (not done)
 

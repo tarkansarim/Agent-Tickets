@@ -733,6 +733,53 @@ def _supervision_ttl_seconds(args):
     return hours * 3600.0
 
 
+def _current_supervision_host():
+    try:
+        return _safe_file_component(os.uname().nodename)
+    except AttributeError:
+        return "host"
+
+
+def _claim_owner_pid_parts(claim):
+    match = re.fullmatch(r"pid:([^:]+):([0-9]+)", str((claim or {}).get("owner_id") or ""))
+    if not match:
+        return None
+    try:
+        return match.group(1), int(match.group(2))
+    except ValueError:
+        return None
+
+
+def _process_is_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return None
+    return True
+
+
+def _claim_owner_process_status(claim):
+    parts = _claim_owner_pid_parts(claim)
+    if not parts:
+        return {"status": "not_pid_owner", "checkable": False}
+    host, pid = parts
+    current_host = _current_supervision_host()
+    if host != current_host:
+        return {"status": "remote", "checkable": False, "host": host, "pid": pid}
+    alive = _process_is_alive(pid)
+    if alive is True:
+        status = "alive"
+    elif alive is False:
+        status = "dead"
+    else:
+        status = "unknown"
+    return {"status": status, "checkable": True, "host": host, "pid": pid}
+
+
 def _supervision_origin_metadata(args):
     origin_repo = (
         getattr(args, "origin_repo", None)
@@ -748,8 +795,11 @@ def _supervision_origin_metadata(args):
     return {"origin_repo": origin_repo, "origin_provider": provider, "origin_session": session}
 
 
-def _claim_is_active(claim, now=None):
+def _claim_is_active(claim, now=None, owner_process=None):
     now = time.time() if now is None else now
+    owner_process = owner_process or _claim_owner_process_status(claim)
+    if owner_process.get("status") == "dead":
+        return False
     expires_at = claim.get("expires_at_epoch")
     try:
         return expires_at is not None and float(expires_at) > now
@@ -770,7 +820,8 @@ def _public_supervision_claim(claim, owner_id=None, now=None):
     now = time.time() if now is None else now
     updated = claim.get("last_heartbeat_epoch") or claim.get("updated_at_epoch") or claim.get("created_at_epoch") or now
     expires = claim.get("expires_at_epoch")
-    active = _claim_is_active(claim, now)
+    owner_process = _claim_owner_process_status(claim)
+    active = _claim_is_active(claim, now, owner_process=owner_process)
     public = {
         "claim_id": claim.get("claim_id"),
         "repo": claim.get("repo"),
@@ -796,6 +847,10 @@ def _public_supervision_claim(claim, owner_id=None, now=None):
         "expires_in_seconds": int(float(expires) - now) if expires is not None else None,
         "heartbeat_count": int(claim.get("heartbeat_count") or 0),
     }
+    if owner_process.get("status") != "not_pid_owner":
+        public["owner_process"] = owner_process
+    if owner_process.get("status") == "dead":
+        public["stale_reason"] = "owner process is not running"
     return public
 
 
@@ -1640,8 +1695,9 @@ def _format_supervision_status(claims):
     for claim in claims:
         state = "active" if claim.get("active") else "stale"
         owner = "owned" if claim.get("owned_by_current") else "other"
+        stale_reason = " stale_reason=%s" % claim.get("stale_reason") if claim.get("stale_reason") else ""
         lines.append(
-            "%s %s (%s): repo=%s tickets=%s owner=%s worker=%s/%s last_heartbeat=%s expires=%s"
+            "%s %s (%s): repo=%s tickets=%s owner=%s worker=%s/%s last_heartbeat=%s expires=%s%s"
             % (
                 claim.get("claim_id"),
                 state,
@@ -1653,6 +1709,7 @@ def _format_supervision_status(claims):
                 claim.get("worker_session") or "-",
                 claim.get("last_heartbeat_at") or "-",
                 claim.get("expires_at") or "-",
+                stale_reason,
             )
         )
     return "\n".join(lines)
@@ -1949,13 +2006,13 @@ def _codex_starter_placeholder_probe(r, provider):
     )
 
 
-def _classify_probe(r, provider=None, accept_idle_would_send=False):
+def _classify_probe(r, provider=None):
     """From a `_agent_contact(..., dry_run=True)` result, decide if this provider
     has a contactable session. Returns ("ok", session_name_or_None) or ("no", reason).
     Trusts rc==0 = contactable except for known non-sendable Codex starter placeholder state
-    outside exact-session supervise probes."""
+    that dry-run can describe as would_send even though live send cannot submit."""
     # DELICATE_FIX: Carefully debugged. Modify only with failing repro + targeted tests.
-    if _codex_starter_placeholder_probe(r, provider) and not accept_idle_would_send:
+    if _codex_starter_placeholder_probe(r, provider):
         return ("no", _probe_reason_with_default(r, "codex starter placeholder has no pending user text"))
     if r.get("ok"):
         sess = (r.get("json") or {}).get("session")
@@ -2529,7 +2586,24 @@ def _contact_missing_window_session(reason):
     return match.group("session").strip().strip("'\"") or None
 
 
+def _contact_refusal_is_codex_starter_placeholder(refusal, expected_session=None):
+    if (refusal or {}).get("provider") != "codex" or not expected_session:
+        return False
+    probe = (refusal or {}).get("probe") or {}
+    payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
+    session = payload.get("session")
+    reason = str((refusal or {}).get("reason") or payload.get("reason") or "")
+    pane_state = str(payload.get("pane_state") or "").lower()
+    return (
+        session == expected_session
+        and pane_state == "idle_empty_prompt"
+        and "codex starter placeholder" in reason
+    )
+
+
 def _batch_refusal_is_safe_absence(refusal, expected_repo=None, expected_session=None):
+    if _contact_refusal_is_codex_starter_placeholder(refusal, expected_session=expected_session):
+        return True
     probe = refusal.get("probe") or {}
     payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
     reason = str(refusal.get("reason") or payload.get("reason") or payload.get("pane_reason") or probe.get("stderr") or "")
@@ -3404,16 +3478,12 @@ def _supervision_blocked(cfg, args, reason, detail, original_id=None):
     return {"ok": False, "status": "blocked", "reason": reason, "detail": detail, "tool_ticket": blocker_id}
 
 
-def _contactable_providers(repo, message, session=None, providers=None, accept_idle_would_send=False):
+def _contactable_providers(repo, message, session=None, providers=None):
     providers = providers or DISPATCH_PROVIDERS
     contactable, refused = [], []
     for provider in providers:
         result = _agent_contact(repo, provider, message, dry_run=True, session=session)
-        kind, info = _classify_probe(
-            result,
-            provider=provider,
-            accept_idle_would_send=bool(accept_idle_would_send and session),
-        )
+        kind, info = _classify_probe(result, provider=provider)
         if kind == "ok":
             contactable.append({"provider": provider, "session": info, "probe": result})
         else:
@@ -3461,7 +3531,6 @@ def cmd_supervise(cfg, args):
         contact_message,
         session=session,
         providers=DISPATCH_PROVIDERS,
-        accept_idle_would_send=True,
     )
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
@@ -3535,7 +3604,7 @@ def cmd_supervise(cfg, args):
         existing = _agent_tmux(["codex-existing", repo, session], timeout=10)
         if _tmux_stdout_is_exact_session(existing or {}, session):
             exact_probe = _agent_contact(repo, "codex", contact_message, dry_run=True, session=session)
-            kind, info = _classify_probe(exact_probe, provider="codex", accept_idle_would_send=True)
+            kind, info = _classify_probe(exact_probe, provider="codex")
             if kind == "ok":
                 selected = {
                     "provider": "codex",

@@ -1284,9 +1284,10 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertNotIn("codex-resume-latest", [call[0] for call in tmux_calls])
         audit.assert_not_called()
 
-    def test_supervise_dry_run_accepts_exact_session_would_send_idle_prompt(self):
+    def test_supervise_dry_run_blocks_exact_session_would_send_idle_prompt_before_send(self):
         task = {"id": 70, "title": "Fix routing mismatch", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         contact_calls = []
+        tmux_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
             contact_calls.append((provider, dry_run, session))
@@ -1310,6 +1311,18 @@ class AgentTicketCliTests(unittest.TestCase):
                 "raw": "",
             }
 
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "stdout": "owner-agent-tickets",
+                    "stderr": "",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            self.fail("idle starter placeholder should block before launch")
+
         args = argparse.Namespace(
             id=70, provider="codex", session="owner-agent-tickets", session_prefix="owner",
             full_permission=True, message="", dry_run=True, no_tool_ticket=True,
@@ -1324,7 +1337,7 @@ class AgentTicketCliTests(unittest.TestCase):
              mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
              mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
              mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
-             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
              mock.patch.object(self.cli, "audit_comment") as audit, \
              mock.patch("sys.stdout", new=out):
             self.cli.cmd_supervise({
@@ -1334,46 +1347,32 @@ class AgentTicketCliTests(unittest.TestCase):
             }, args)
 
         result = json.loads(out.getvalue())
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["dry_run"])
-        self.assertEqual("contact", result["route"]["mode"])
-        self.assertEqual("codex", result["route"]["provider"])
+        self.assertFalse(result["ok"])
+        self.assertEqual("existing session not contactable", result["reason"])
         self.assertEqual("owner-agent-tickets", result["route"]["session"])
-        self.assertEqual(["claude"], [item["provider"] for item in result["refused"]])
-        self.assertIn("no tmux-managed claude pane found", result["refused"][0]["reason"])
-        self.assertIn(("codex", True, "owner-agent-tickets"), contact_calls)
-        tmux.assert_not_called()
+        self.assertIn("codex starter placeholder has no pending user text", result["detail"])
+        self.assertTrue(all(call[1] for call in contact_calls))
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-agent-tickets"]], tmux_calls)
         audit.assert_not_called()
 
-    def test_supervise_live_send_reports_starter_placeholder_after_safe_dry_run(self):
+    def test_supervise_live_blocks_starter_placeholder_before_live_send(self):
         task = {"id": 70, "title": "Fix routing mismatch", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         contact_calls = []
+        tmux_calls = []
 
         def fake_contact(repo, provider, message, dry_run=False, session=None):
             contact_calls.append((provider, dry_run, session))
             if provider == "codex" and session == "owner-agent-tickets":
-                if dry_run:
-                    return {
-                        "ok": True,
-                        "rc": 0,
-                        "json": {
-                            "status": "would_send",
-                            "session": "owner-agent-tickets",
-                            "pane_state": "idle_empty_prompt",
-                        },
-                        "stderr": "",
-                        "raw": "{}",
-                    }
                 return {
-                    "ok": False,
-                    "rc": 3,
+                    "ok": True,
+                    "rc": 0,
                     "json": {
-                        "reason": "codex starter placeholder has no pending user text",
+                        "status": "would_send",
                         "session": "owner-agent-tickets",
                         "pane_state": "idle_empty_prompt",
                     },
                     "stderr": "",
-                    "raw": "",
+                    "raw": "{}",
                 }
             return {
                 "ok": False,
@@ -1382,6 +1381,18 @@ class AgentTicketCliTests(unittest.TestCase):
                 "stderr": "",
                 "raw": "",
             }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": True,
+                    "rc": 0,
+                    "stdout": "owner-agent-tickets",
+                    "stderr": "",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            self.fail("idle starter placeholder should block before launch")
 
         args = argparse.Namespace(
             id=70, provider="codex", session="owner-agent-tickets", session_prefix="owner",
@@ -1397,7 +1408,7 @@ class AgentTicketCliTests(unittest.TestCase):
              mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
              mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
              mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
-             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
              mock.patch.object(self.cli, "audit_comment") as audit, \
              mock.patch("sys.stdout", new=out):
             self.cli.cmd_supervise({
@@ -1408,15 +1419,12 @@ class AgentTicketCliTests(unittest.TestCase):
 
         result = json.loads(out.getvalue())
         self.assertFalse(result["ok"])
-        self.assertEqual("send refused", result["reason"])
-        self.assertIn("guarded dry-run accepted codex session owner-agent-tickets", result["detail"])
-        self.assertIn("status=would_send", result["detail"])
-        self.assertIn("state=idle_empty_prompt", result["detail"])
+        self.assertEqual("existing session not contactable", result["reason"])
         self.assertIn("codex starter placeholder has no pending user text", result["detail"])
         self.assertIn("owner-agent-tickets", result["detail"])
         self.assertIn(("codex", True, "owner-agent-tickets"), contact_calls)
-        self.assertIn(("codex", False, "owner-agent-tickets"), contact_calls)
-        tmux.assert_not_called()
+        self.assertNotIn(("codex", False, "owner-agent-tickets"), contact_calls)
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-agent-tickets"]], tmux_calls)
         audit.assert_not_called()
 
     def test_supervise_contact_uses_compact_message_for_claude_live_send(self):
@@ -2523,6 +2531,45 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("batch-owner-demo", claim["worker_session"])
         self.assertGreaterEqual(claim["age_seconds"], 0)
         self.assertGreater(claim["expires_in_seconds"], 0)
+
+    def test_supervision_status_marks_dead_local_pid_owner_claim_stale_before_ttl(self):
+        owner_id = "pid:%s:424242" % self.cli._current_supervision_host()
+        self.write_supervision_claims({
+            "claim-dead": self.active_supervision_claim(
+                claim_id="claim-dead", owner_id=owner_id, ticket_ids=[80], repo="/tmp/demo", ttl=3600),
+        })
+        out = io.StringIO()
+        args = argparse.Namespace(
+            action="status", claim=None, repo=None, ticket=None, all=True,
+            supervisor_id="current-supervisor", force=False, json=True,
+        )
+        with mock.patch.object(self.cli, "_process_is_alive", return_value=False), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervision(None, args)
+
+        result = json.loads(out.getvalue())
+        claim = result["claims"][0]
+        self.assertEqual("claim-dead", claim["claim_id"])
+        self.assertFalse(claim["active"])
+        self.assertTrue(claim["stale"])
+        self.assertEqual("dead", claim["owner_process"]["status"])
+        self.assertEqual("owner process is not running", claim["stale_reason"])
+
+    def test_supervision_preflight_does_not_block_on_dead_local_pid_owner_claim(self):
+        owner_id = "pid:%s:424242" % self.cli._current_supervision_host()
+        self.write_supervision_claims({
+            "claim-dead": self.active_supervision_claim(
+                claim_id="claim-dead", owner_id=owner_id, ticket_ids=[80], repo="/tmp/demo", ttl=3600),
+        })
+
+        with mock.patch.object(self.cli, "_process_is_alive", return_value=False):
+            preflight = self.cli._supervision_preflight(
+                self.batch_args(supervisor_id="current-supervisor"), "/tmp/demo", [80])
+
+        self.assertFalse(preflight["blocked"])
+        self.assertEqual([], preflight["conflicting_claims"])
+        self.assertEqual("claim-dead", preflight["stale_claims"][0]["claim_id"])
+        self.assertEqual("owner process is not running", preflight["stale_claims"][0]["stale_reason"])
 
     def test_supervision_release_requires_ownership_or_stale_claim(self):
         self.write_supervision_claims({
