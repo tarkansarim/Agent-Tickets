@@ -1988,32 +1988,11 @@ def _probe_reason(r):
     return reason or "unknown"
 
 
-def _probe_reason_with_default(r, default_reason):
-    payload = dict(r.get("json") or {})
-    payload.setdefault("reason", default_reason)
-    enriched = dict(r)
-    enriched["json"] = payload
-    return _probe_reason(enriched)
-
-
-def _codex_starter_placeholder_probe(r, provider):
-    if provider != "codex" or not r.get("ok"):
-        return False
-    payload = r.get("json") if isinstance(r.get("json"), dict) else {}
-    return (
-        str(payload.get("status") or "").lower() == "would_send"
-        and str(payload.get("pane_state") or "").lower() == "idle_empty_prompt"
-    )
-
-
 def _classify_probe(r, provider=None):
     """From a `_agent_contact(..., dry_run=True)` result, decide if this provider
     has a contactable session. Returns ("ok", session_name_or_None) or ("no", reason).
-    Trusts rc==0 = contactable except for known non-sendable Codex starter placeholder state
-    that dry-run can describe as would_send even though live send cannot submit."""
+    Trusts rc==0 = contactable; agent-contact owns pane-state safety and composer cleanup policy."""
     # DELICATE_FIX: Carefully debugged. Modify only with failing repro + targeted tests.
-    if _codex_starter_placeholder_probe(r, provider):
-        return ("no", _probe_reason_with_default(r, "codex starter placeholder has no pending user text"))
     if r.get("ok"):
         sess = (r.get("json") or {}).get("session")
         return ("ok", sess)   # sess may be None — the real send will re-discover

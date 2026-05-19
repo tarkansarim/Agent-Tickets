@@ -142,7 +142,7 @@ Ticket #51 added a durable local claim layer so a second supervisor can see that
 - Routed supervisors heartbeat the claim while polling. When all routed tickets close or move to `Needs human`, the claim is released. If the supervisor exits while tickets remain open or is interrupted, the claim remains visible until expiry and can be recovered explicitly.
 - `agent-ticket supervision status|release|adopt|steal` is the recovery surface. Status lists active and stale claims; release/adopt/steal require a claim/repo/ticket/all filter and only act on claims owned by the current supervisor or stale claims unless `--force` is supplied.
 - Default process-bound owners use `owner_id=pid:<host>:<pid>`. For claims from this host, a dead owner PID makes the claim stale immediately, so later `supervise`/`supervise-batch` calls do not wait for TTL or require `--force-supervision`; explicit stable `--supervisor-id` claims remain TTL/recovery based.
-- Codex `idle_empty_prompt` starter placeholders are not treated as contactable even when guarded dry-run reports `would_send`. Supervision revalidates the exact session and blocks before live send rather than creating a dry-run/live mismatch.
+- Ticket #149 removed the stale `idle_empty_prompt` override after `agent-contact` made tmux-managed worker composers a disposable control surface. Supervision now treats any successful guarded dry-run (`rc=0`, including `status=would_send` with an informational `pane_reason`) as contactable and leaves pane-state safety and cleanup policy to `agent-contact`; nonzero guarded refusals still block through the existing refusal paths.
 
 ## Open / possible follow-ups (not done)
 
