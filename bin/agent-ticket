@@ -2505,6 +2505,33 @@ def _supervise_send_refusal_detail(selected, route, send):
     )
 
 
+def _post_launch_prompt_block(probe):
+    payload = probe.get("json") if isinstance((probe or {}).get("json"), dict) else {}
+    reason = str(payload.get("reason") or payload.get("pane_reason") or (probe or {}).get("stderr") or "")
+    pane_state = str(payload.get("pane_state") or "").lower()
+    reason_lower = reason.lower()
+    return (
+        pane_state in ("trust_prompt", "approval_prompt")
+        or "directory trust prompt" in reason_lower
+        or "trust prompt" in reason_lower
+        or "approval prompt" in reason_lower
+    )
+
+
+def _guard_launched_session_prompt(repo, provider, session, message):
+    probe = _agent_contact(repo, provider, message, dry_run=True, session=session)
+    if probe.get("ok") or not _post_launch_prompt_block(probe):
+        return None, probe
+    return {
+        "status": "blocked",
+        "reason": "launched session blocked by prompt",
+        "detail": (
+            "agent-contact dry-run refused launched %s session %s before ticket route audit/move: %s"
+            % (provider, session, _probe_reason(probe))
+        ),
+    }, probe
+
+
 def _batch_ticket_summary(cfg, ticket, tags, column=None, kind=None):
     column = column or column_name(cfg, ticket["column_id"])
     kind = kind if kind is not None else category_name(cfg, ticket.get("category_id"))
@@ -3154,6 +3181,15 @@ def _batch_route_group(cfg, args, group):
             route["reason"] = "agent-tmux launch failed"
             route["detail"] = "%s\n%s" % (launch.get("stderr", ""), launch.get("stdout", ""))
             return result
+        prompt_block, prompt_probe = _guard_launched_session_prompt(
+            group["repo"], route["provider"], route["session"], message)
+        route["post_launch_contact_probe"] = prompt_probe.get("json") or prompt_probe.get("raw")
+        if prompt_block:
+            _release_supervision_claim(claim_id)
+            result.pop("_supervision_claim_id", None)
+            result["status"] = "blocked"
+            route.update(prompt_block)
+            return result
 
     route["status"] = "routed"
     result["status"] = "routed"
@@ -3713,6 +3749,15 @@ def cmd_supervise(cfg, args):
             _release_supervision_claim(claim_id)
             result = _supervision_blocked(cfg, args, "agent-tmux launch failed",
                                           "%s\n%s" % (launch.get("stderr", ""), launch.get("stdout", "")), args.id)
+            out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
+            return
+        prompt_block, prompt_probe = _guard_launched_session_prompt(
+            repo, route["provider"], route["session"], launch_message)
+        route["post_launch_contact_probe"] = prompt_probe.get("json") or prompt_probe.get("raw")
+        if prompt_block:
+            _release_supervision_claim(claim_id)
+            result = _supervision_blocked(cfg, args, prompt_block["reason"], prompt_block["detail"], args.id)
+            result["route"] = route
             out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
             return
 

@@ -3153,6 +3153,70 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("batch-owner-demo", tmux_calls[-1][1])
         self.assertEqual("/tmp/demo", tmux_calls[-1][2])
 
+    def test_supervise_batch_blocks_launched_worker_stuck_at_trust_prompt_before_ticket_mutation(self):
+        group = {
+            "project": "demo",
+            "repo": "/tmp/demo",
+            "tickets": [{"id": 81, "title": "One", "severity": "p1", "kind": "bug", "column": "New",
+                         "column_id": 1, "swimlane_id": 1, "project": "demo", "repo": "/tmp/demo", "url": "u"}],
+        }
+        tmux_calls = []
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo",
+                    "rc": 1,
+                    "argv": ["agent-tmux"] + argv,
+                }
+            return {"ok": True, "stdout": "launched", "stderr": "", "rc": 0, "argv": ["agent-tmux"] + argv}
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            self.assertTrue(dry_run)
+            self.assertEqual("batch-owner-demo", session)
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {
+                    "status": "refused",
+                    "reason": "directory trust prompt is visible",
+                    "session": "batch-owner-demo",
+                    "pane_state": "trust_prompt",
+                },
+                "stderr": "",
+                "raw": "{}",
+            }
+
+        with mock.patch.object(self.cli, "_contactable_providers", return_value=([], [
+                 {"provider": "codex", "reason": "no tmux-managed codex pane found for /tmp/demo", "probe": {}},
+                 {"provider": "claude", "reason": "no tmux-managed claude pane found for /tmp/demo", "probe": {}},
+             ])), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "get_task_in_project", return_value={
+                 "id": 81, "title": "One", "column_id": 1, "category_id": 1, "is_active": 1, "swimlane_id": 1,
+             }), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "p1"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "category_name", return_value="bug"), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch.object(self.cli, "move_task_to_column") as move:
+            result = self.cli._batch_route_group(
+                {"endpoint": "http://kanboard.invalid/jsonrpc.php"}, self.batch_args(), group)
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("launched session blocked by prompt", result["route"]["reason"])
+        self.assertIn("trust prompt", result["route"]["detail"])
+        self.assertEqual(["codex-existing", "codex-existing", "codex-existing", "codex"], [call[0] for call in tmux_calls])
+        audit.assert_not_called()
+        move.assert_not_called()
+        leases = json.loads(pathlib.Path(self.cli.SUPERVISION_LEASES_PATH).read_text())
+        self.assertEqual({}, leases["claims"])
+
     def test_supervise_batch_blocks_if_codex_session_appears_before_launch(self):
         group = {
             "project": "demo",
