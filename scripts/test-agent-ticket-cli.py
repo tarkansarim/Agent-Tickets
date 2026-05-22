@@ -3211,7 +3211,7 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual("blocked", result["status"])
         self.assertEqual("launched session blocked by prompt", result["route"]["reason"])
         self.assertIn("trust prompt", result["route"]["detail"])
-        self.assertEqual(["codex-existing", "codex-existing", "codex-existing", "codex"], [call[0] for call in tmux_calls])
+        self.assertEqual(["codex-existing", "codex-existing", "codex-existing", "codex", "stop"], [call[0] for call in tmux_calls])
         audit.assert_not_called()
         move.assert_not_called()
         leases = json.loads(pathlib.Path(self.cli.SUPERVISION_LEASES_PATH).read_text())

@@ -3208,6 +3208,7 @@ def _batch_route_group(cfg, args, group):
             group["repo"], route["provider"], route["session"], message)
         route["post_launch_contact_probe"] = prompt_probe.get("json") or prompt_probe.get("raw")
         if prompt_block:
+            route["post_launch_stop"] = _agent_tmux(["stop", route["session"]], timeout=10)
             _release_supervision_claim(claim_id)
             result.pop("_supervision_claim_id", None)
             result["status"] = "blocked"
@@ -3778,6 +3779,7 @@ def cmd_supervise(cfg, args):
             repo, route["provider"], route["session"], launch_message)
         route["post_launch_contact_probe"] = prompt_probe.get("json") or prompt_probe.get("raw")
         if prompt_block:
+            route["post_launch_stop"] = _agent_tmux(["stop", route["session"]], timeout=10)
             _release_supervision_claim(claim_id)
             result = _supervision_blocked(cfg, args, prompt_block["reason"], prompt_block["detail"], args.id)
             result["route"] = route
