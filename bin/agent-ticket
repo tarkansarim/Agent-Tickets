@@ -2526,8 +2526,9 @@ def _post_launch_probe_should_retry(probe):
     pane_state = str(payload.get("pane_state") or "").lower()
     status = str(payload.get("status") or "").lower()
     return (
-        pane_state in ("idle_empty_prompt", "starting", "unknown")
+        pane_state in ("idle_empty_prompt", "starting", "unknown", "dead_or_unknown")
         or "codex starter placeholder" in reason
+        or "capture was empty" in reason
         or status in ("starting", "unknown")
     )
 
