@@ -44,6 +44,8 @@ DEFAULT_SUPERVISION_TTL_HOURS = 6
 SUPERVISE_RESUME_LATEST_SKIP_REASON = (
     "fresh ticket-scoped owner lane required; codex-latest/resume-latest is not deterministic owner evidence"
 )
+POST_LAUNCH_PROMPT_PROBE_ATTEMPTS = 10
+POST_LAUNCH_PROMPT_PROBE_INTERVAL = 0.5
 
 KIND_CHOICES = ["bug", "friction", "request", "blocker", "question", "idea", "regression"]
 SEVERITY_CHOICES = ["p1", "p2", "p3"]
@@ -2518,10 +2520,30 @@ def _post_launch_prompt_block(probe):
     )
 
 
+def _post_launch_probe_should_retry(probe):
+    payload = probe.get("json") if isinstance((probe or {}).get("json"), dict) else {}
+    reason = str(payload.get("reason") or payload.get("pane_reason") or (probe or {}).get("stderr") or "").lower()
+    pane_state = str(payload.get("pane_state") or "").lower()
+    status = str(payload.get("status") or "").lower()
+    return (
+        pane_state in ("idle_empty_prompt", "starting", "unknown")
+        or "codex starter placeholder" in reason
+        or status in ("starting", "unknown")
+    )
+
+
 def _guard_launched_session_prompt(repo, provider, session, message):
-    probe = _agent_contact(repo, provider, message, dry_run=True, session=session)
-    if probe.get("ok") or not _post_launch_prompt_block(probe):
-        return None, probe
+    probe = None
+    for attempt in range(POST_LAUNCH_PROMPT_PROBE_ATTEMPTS):
+        probe = _agent_contact(repo, provider, message, dry_run=True, session=session)
+        if _post_launch_prompt_block(probe):
+            break
+        if not _post_launch_probe_should_retry(probe):
+            return None, probe
+        if attempt + 1 < POST_LAUNCH_PROMPT_PROBE_ATTEMPTS:
+            time.sleep(POST_LAUNCH_PROMPT_PROBE_INTERVAL)
+    if not _post_launch_prompt_block(probe or {}):
+        return None, probe or {}
     return {
         "status": "blocked",
         "reason": "launched session blocked by prompt",
