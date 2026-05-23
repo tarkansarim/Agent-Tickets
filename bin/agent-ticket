@@ -2615,6 +2615,18 @@ def _contact_missing_window_session(reason):
     return match.group("session").strip().strip("'\"") or None
 
 
+def _contact_missing_tmux_server_socket(reason):
+    match = re.search(
+        r"\btmux pane discovery failed:\s*error connecting to\s+(?P<socket>\S+)\s+"
+        r"\(No such file or directory\)\s*$",
+        reason or "",
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group("socket").strip().strip("'\"") or None
+
+
 def _contact_refusal_is_codex_starter_placeholder(refusal, expected_session=None):
     if (refusal or {}).get("provider") != "codex" or not expected_session:
         return False
@@ -2637,6 +2649,8 @@ def _batch_refusal_is_safe_absence(refusal, expected_repo=None, expected_session
     payload = probe.get("json") if isinstance(probe.get("json"), dict) else {}
     reason = str(refusal.get("reason") or payload.get("reason") or payload.get("pane_reason") or probe.get("stderr") or "")
     if expected_session is not None and _contact_missing_window_session(reason) == str(expected_session):
+        return True
+    if _contact_missing_tmux_server_socket(reason):
         return True
     reported_repo = _batch_contact_absence_repo(reason)
     if not reported_repo:
