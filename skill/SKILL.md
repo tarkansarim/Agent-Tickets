@@ -21,8 +21,15 @@ You're *operating* something — a tool, a CLI, a built app, the harness, an MCP
 - the **harness / runtime / MCP server misbehaved** — bad responses, hangs, wrong state
 - a **blocker** while using something: missing creds, broken dependency, ambiguous behavior you need a human to resolve
 - recurring **friction** in a workflow worth smoothing
+- **instruction friction**: rules, docs, prompts, skills, runbooks, or tool guidance are vague, wrong, stale, incomplete, or missing and that gap costs task time or creates risk
 - a **regression** — something that used to work and now doesn't
 - a **request / idea** to improve a tool you were using
+
+When instruction friction happens, file a `friction` ticket even if you can
+resolve the immediate task and keep working. The ticket body must name the
+instruction source, the exact friction, expected behavior, observed behavior,
+and impact. This captures reusable workflow debt instead of relying on the user
+to notice and ask for a ticket later.
 
 ## What this board is NOT for
 

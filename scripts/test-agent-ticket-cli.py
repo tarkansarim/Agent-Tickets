@@ -2146,6 +2146,8 @@ class AgentTicketCliTests(unittest.TestCase):
             "## Discovery Triggers",
             "## Who files vs. who consumes",
             "## Dispatching a filed ticket to its owner agent",
+            "instruction source, the exact friction, expected behavior, observed behavior,\nand impact",
+            "file a `friction` ticket even if you can\nresolve the immediate task",
             "agent-ticket supervise 42 --full-permission",
             "agent-ticket closeout-check 42 --strict",
             "agent-ticket callbacks --pending --repo <repo>",

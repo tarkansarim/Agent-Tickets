@@ -1,6 +1,6 @@
 # agent-tickets
 
-Local ticketing system for AI agents to report problems they hit **while using/operating the user's apps and tools** (crashes, wrong behavior, broken CLI flags, bad docs, harness/runtime misbehavior, friction). **Not** a development backlog. Backed by a self-hosted Kanboard — no cloud, no account, no git.
+Local ticketing system for AI agents to report problems they hit **while using/operating the user's apps and tools** (crashes, wrong behavior, broken CLI flags, bad docs, vague/stale/missing instructions that cause task friction, harness/runtime misbehavior, friction). **Not** a development backlog. Backed by a self-hosted Kanboard — no cloud, no account, no git.
 
 MyTools is where stuff is **created**. This directory is the dev / source-of-truth copy. `install.sh` **copies** files out onto a machine — it does **not** symlink — so normal ticket operations do not reference back into MyTools at runtime; MyTools can be unmounted and the ticketing system still works. Re-run `install.sh` to push updates after editing the source here. The installed CLI also has a diagnostic `agent-ticket source-info` command that reports which source folder produced it, whether the installed copy still matches `bin/agent-ticket`, and what git status is visible for the source folder.
 
