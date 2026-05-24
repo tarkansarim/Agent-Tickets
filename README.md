@@ -48,6 +48,29 @@ This repository is the source copy. `install.sh` copies the CLI, skill docs,
 hooks, and compose file into their runtime locations; it does not symlink them.
 Re-run `install.sh` after source changes to roll out updates.
 
+## Dependencies
+
+Hard runtime dependencies:
+
+- Python 3
+- Docker with the Docker Compose plugin
+- `kanboard/kanboard:v1.2.52`, started locally by `docker-compose.yml`
+- A Kanboard application API token in `~/.config/agent-tickets/config.json`
+
+Optional coordination dependencies:
+
+- `agent-contact`: guarded cross-agent messaging for dispatch, callbacks, and
+  safety checks.
+- `agent-tmux`: deterministic Codex/Claude worker launch and session discovery
+  for `supervise` and `supervise-batch`.
+- Repo roots configured in `repo_roots`, defaulting to `~/Dropbox/work/MyTools`,
+  so `project:<repo-name>` tickets can resolve to source repo paths.
+
+Without `agent-contact`/`agent-tmux`, normal ticket filing, listing, comments,
+moves, closes, and Kanboard board operations still work. Cross-repo owner-agent
+handoff and supervision need those tools on `PATH` and trusted-root environment
+variables configured.
+
 ## Layout
 
 ```
