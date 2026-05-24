@@ -82,6 +82,8 @@ agent-tickets/                          # <- dev / source of truth (this folder,
   config.example.json     # token-less template           -> seeds ~/.config/agent-tickets/config.json (only if missing)
   bootstrap-board.py      # idempotently creates the project + columns + categories in Kanboard, writes project_id to config
   install.sh              # roll out onto a machine (idempotent; copies, doesn't symlink; installs skill+CLI for Claude Code AND Codex, registers notify hooks, runs bootstrap once a token is set)
+  install-windows.bat     # native Windows installer entrypoint
+  scripts/install-windows.ps1    # PowerShell implementation for native Windows install
   scripts/notify-hook.sh        # agent-neutral hook: surfaces open tickets for the repo the agent is in -> ~/.config/agent-tickets/notify-hook.sh
   scripts/register-hooks.py     # idempotently wires notify-hook.sh into ~/.claude/settings.json and ~/.codex/hooks.json
   scripts/check-kanboard-version.sh   # compares the pinned Kanboard image tag against the latest release
@@ -103,24 +105,34 @@ For portability/backup, periodically copy `~/kanboard-data/data/db.sqlite` somew
 
 ## Quick Start
 
-Install target:
+Install targets:
 
-- Linux, or Windows through WSL.
+- Linux
+- Native Windows
 
 Prerequisites:
 
 - Python 3
-- Docker with the Docker Compose plugin
-- `~/.local/bin` on your shell `PATH`
+- Docker with the Docker Compose plugin, or Docker Desktop on Windows
+- Linux: `~/.local/bin` on your shell `PATH`
+- Windows: `%USERPROFILE%\.local\bin` on your `PATH`
 
 There is no virtualenv and no `pip install` step.
 
-Install:
+Install on Linux:
 
 ```bash
 git clone <repo-url> agent-tickets
 cd agent-tickets
 ./install.sh
+```
+
+Install on Windows:
+
+```bat
+git clone <repo-url> agent-tickets
+cd agent-tickets
+install-windows.bat
 ```
 
 Finish first-time setup:
@@ -154,6 +166,8 @@ agent-ticket close <id>
 ```
 
 Re-run `./install.sh` after source updates. It overwrites installed code/docs, but it does not overwrite your real `~/.config/agent-tickets/config.json`.
+
+On Windows, re-run `install-windows.bat` after source updates.
 
 Installer smoke test for maintainers:
 

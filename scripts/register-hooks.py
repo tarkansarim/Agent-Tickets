@@ -19,7 +19,7 @@ HOOK = os.path.realpath(sys.argv[1])
 if not os.path.exists(HOOK):
     sys.exit("register-hooks: %s does not exist" % HOOK)
 
-MARKER = "notify-hook.sh"   # how we recognise our own hook entries on re-runs
+MARKER = "notify-hook"   # recognises notify-hook.sh and Windows notify-hook.cmd on re-runs
 
 
 def _entry(mode):

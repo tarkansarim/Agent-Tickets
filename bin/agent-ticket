@@ -17,7 +17,15 @@ Env overrides: AGENT_TICKETS_ENDPOINT, AGENT_TICKETS_TOKEN,
 Output is human-readable by default; pass --json (before OR after the
 subcommand) for raw JSON.
 """
-import argparse, base64, calendar, fcntl, hashlib, json, os, re, subprocess, sys, threading, time, urllib.request, urllib.error
+import argparse, base64, calendar, hashlib, json, os, re, subprocess, sys, threading, time, urllib.request, urllib.error
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
+else:
+    msvcrt = None
 
 CONFIG_PATH = os.path.expanduser("~/.config/agent-tickets/config.json")
 CONFIG_DIR = os.path.dirname(CONFIG_PATH)
@@ -60,6 +68,24 @@ _VALIDATION_RE = re.compile(
     r"\b(validation|validated|verification|verified|test|tests|pytest|py_compile|ctest|smoke|build|lint)\b",
     re.IGNORECASE,
 )
+
+
+def _lock_fd(fd):
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b"\0")
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+
+
+def _unlock_fd(fd):
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 _COMMIT_RE = re.compile(r"\b(?:commit|head|revision)\s*[:=]?\s*([0-9a-f]{7,40})\b", re.IGNORECASE)
 _INSTALL_RE = re.compile(r"\b(install|installed|rollout|roll out|rolled out|sync|synchronized|source-info)\b", re.IGNORECASE)
 
@@ -529,7 +555,7 @@ def _lock_watcher_store():
             os.chmod(WATCHERS_LOCK_PATH, 0o600)
         except OSError:
             pass
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         return fd
     except OSError as e:
         sys.exit("agent-ticket: couldn't lock callback watcher store %s (%s)" % (WATCHERS_LOCK_PATH, e))
@@ -537,7 +563,7 @@ def _lock_watcher_store():
 
 def _unlock_watcher_store(fd):
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
     finally:
         os.close(fd)
 
@@ -614,7 +640,7 @@ def _lock_batch_repo(repo):
             os.chmod(path, 0o600)
         except OSError:
             pass
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         os.ftruncate(fd, 0)
         os.write(fd, json.dumps({"repo": os.path.realpath(os.path.expanduser(str(repo))), "pid": os.getpid(), "locked_at": _utc_iso()}).encode("utf-8"))
         return fd
@@ -629,7 +655,7 @@ def _lock_batch_repo(repo):
 
 def _unlock_batch_repo(fd):
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
     finally:
         os.close(fd)
 
@@ -652,7 +678,7 @@ def _lock_supervision_store():
             os.chmod(SUPERVISION_LOCK_PATH, 0o600)
         except OSError:
             pass
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         return fd
     except OSError as e:
         sys.exit("agent-ticket: couldn't lock supervision claim store %s (%s)" % (SUPERVISION_LOCK_PATH, e))
@@ -660,7 +686,7 @@ def _lock_supervision_store():
 
 def _unlock_supervision_store(fd):
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
     finally:
         os.close(fd)
 
@@ -1140,7 +1166,7 @@ def _lock_event(event_key):
             os.chmod(_event_lock_path(event_key), 0o600)
         except OSError:
             pass
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         return fd
     except OSError as e:
         sys.exit("agent-ticket: couldn't lock callback event %s (%s)" % (event_key, e))
@@ -1148,7 +1174,7 @@ def _lock_event(event_key):
 
 def _unlock_event(fd):
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
     finally:
         os.close(fd)
 

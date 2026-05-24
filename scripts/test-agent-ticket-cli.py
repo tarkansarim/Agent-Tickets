@@ -2310,6 +2310,46 @@ class AgentTicketCliTests(unittest.TestCase):
             self.assertIn("unknown argument: --dry-run", bad_result.stderr)
             self.assertFalse((pathlib.Path(home) / ".local" / "bin" / "agent-ticket").exists())
 
+    def test_windows_installer_entrypoint_is_documented_and_uses_powershell(self):
+        bat = (ROOT / "install-windows.bat").read_text()
+        ps1 = (ROOT / "scripts" / "install-windows.ps1").read_text()
+        readme = (ROOT / "README.md").read_text()
+        register_hooks = (ROOT / "scripts" / "register-hooks.py").read_text()
+
+        self.assertIn("powershell.exe -NoProfile -ExecutionPolicy Bypass", bat)
+        self.assertIn(r"scripts\install-windows.ps1", bat)
+        self.assertIn("Usage: install-windows.bat", ps1)
+        self.assertIn("Docker Desktop", ps1)
+        self.assertIn("agent-ticket.cmd", ps1)
+        self.assertIn("install-windows.bat", readme)
+        self.assertIn('MARKER = "notify-hook"', register_hooks)
+
+    def test_cli_imports_when_fcntl_is_unavailable(self):
+        import builtins
+        import types
+
+        original_import = builtins.__import__
+        dummy_msvcrt = types.SimpleNamespace(LK_LOCK=1, LK_UNLCK=2, locking=lambda *a, **k: None)
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "fcntl":
+                raise ImportError("no fcntl on this platform")
+            if name == "msvcrt":
+                return dummy_msvcrt
+            return original_import(name, globals, locals, fromlist, level)
+
+        builtins.__import__ = fake_import
+        try:
+            loader = SourceFileLoader("agent_ticket_no_fcntl", str(ROOT / "bin" / "agent-ticket"))
+            spec = spec_from_loader(loader.name, loader)
+            module = module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            builtins.__import__ = original_import
+
+        self.assertIsNone(module.fcntl)
+        self.assertIs(module.msvcrt, dummy_msvcrt)
+
     def test_supervise_batch_groups_same_repo_queue_and_skips_default_refusals(self):
         tasks = [
             {"id": 70, "title": "P1 demo", "column_id": 1, "category_id": 1, "is_active": 1},
