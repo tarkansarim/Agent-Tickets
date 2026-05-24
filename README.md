@@ -1,10 +1,40 @@
 # agent-tickets
 
-`agent-tickets` is a local Kanboard-backed issue queue for AI coding agents.
+`agent-tickets` is a local cross-repo dependency management and agent
+coordination system. It is built for environments where many repositories work
+together tightly, each repo may have its own owner agent, and work often crosses
+repo boundaries.
 
-Use it when an agent hits a real problem while using a tool, app, CLI, harness, or repo workflow and that problem needs to be recorded, routed, or fixed later. Typical tickets are crashes, wrong output, broken CLI flags, misleading docs, missing setup instructions, runtime/harness failures, and cross-repo friction.
+Use it when one repo's agent needs another repo's agent to fix a bug, implement
+a supporting feature, repair setup/docs, investigate an integration break, or
+unblock a dependent workflow. The ticket becomes the durable handoff: what is
+needed, which repo owns it, who is working it, what evidence proves it was fixed,
+and whether the requester needs a callback when it closes.
 
-This is not a product backlog, project planner, or generic TODO list. It is for operational problems found while using things.
+The point is to stop cross-repo work from getting lost in chat history or
+handled through unsafe ad hoc agent messages. `agent-tickets` gives agents a
+shared local board plus guarded routing, supervision, and closeout checks so
+work can move from the requesting repo to the owning repo and back with an audit
+trail.
+
+The system is built around a self-hosted Kanboard instance plus a small
+dependency-free Python CLI:
+
+- `agent-ticket new` files a structured ticket with kind, severity, project,
+  agent, tags, and body text.
+- `agent-ticket list/show/comment/move/tag/close/reopen` handles normal board
+  operations from the terminal.
+- `agent-ticket dispatch` can explicitly notify the owner agent for another
+  repo.
+- `agent-ticket supervise` and `supervise-batch` can route higher-stakes work
+  through guarded tmux-managed owner-agent sessions, poll progress, and run
+  closeout checks.
+- Installed agent hooks can surface open tickets automatically when Codex or
+  Claude starts in a repo.
+
+This is intentionally not a generic TODO list. It is for cross-repo dependencies,
+inter-agent requests, integration blockers, bug fixes, support features, and
+other work that needs a durable owner/reporter handoff.
 
 The board is local-first:
 
@@ -14,7 +44,9 @@ The board is local-first:
 - Nothing is stored in a cloud ticket service.
 - Normal ticket operations use the installed CLI at `~/.local/bin/agent-ticket`.
 
-This repository is the source copy. `install.sh` copies the CLI, skill docs, hooks, and compose file into their runtime locations; it does not symlink them. Re-run `install.sh` after source changes to roll out updates.
+This repository is the source copy. `install.sh` copies the CLI, skill docs,
+hooks, and compose file into their runtime locations; it does not symlink them.
+Re-run `install.sh` after source changes to roll out updates.
 
 ## Layout
 
