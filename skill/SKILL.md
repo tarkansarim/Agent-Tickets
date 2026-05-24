@@ -13,6 +13,39 @@ Load this skill when the user or current task asks to file, report, open, log, c
 
 Representative routes: `agent-ticket new`, `agent-ticket list`, `agent-ticket dispatch <id>`, `agent-ticket supervise <id>`, `agent-ticket closeout-check <id>`, and `agent-ticket callbacks`.
 
+## Onboarding Dependency Check
+
+For full cross-repo coordination, `agent-tickets` expects
+`Agent-Terminal-Contact` to be installed:
+https://github.com/tarkansarim/Agent-Terminal-Contact
+
+Before using `dispatch`, `supervise`, `supervise-batch`, or watched-ticket
+callbacks, check the user-level tools:
+
+```bash
+command -v agent-contact
+command -v agent-tmux
+agent-contact artifact-info --all --json
+```
+
+If both commands are present and `artifact-info` reports owned/matching
+`agent-contact` and `agent-tmux` artifacts, continue. If either command is
+missing, stale, or not owned by `Agent-Terminal-Contact`, do not silently
+degrade the user's cross-repo workflow. Tell the user that Agent-Terminal-Contact
+is required for owner-agent routing/supervision, then get it sorted by cloning
+and installing the source repo:
+
+```bash
+cd ~/Dropbox/work/MyTools
+git clone https://github.com/tarkansarim/Agent-Terminal-Contact.git
+cd Agent-Terminal-Contact
+bash scripts/install.sh --force
+bash scripts/install.sh --check
+```
+
+If the clone target or install command fails, classify it as a tool/onboarding
+issue and report the exact command and output before trying any workaround.
+
 ## What this board IS for
 
 You're *operating* something — a tool, a CLI, a built app, the harness, an MCP server, a script — and it goes wrong. File a ticket so the user (or a later agent) can fix it:

@@ -74,6 +74,24 @@ moves, closes, and Kanboard board operations still work. Cross-repo owner-agent
 handoff, callbacks, and supervision need `agent-contact`/`agent-tmux` on `PATH`
 and trusted-root environment variables configured.
 
+Agent onboarding check:
+
+```bash
+command -v agent-contact
+command -v agent-tmux
+agent-contact artifact-info --all --json
+```
+
+If those tools are missing, clone and install the dependency:
+
+```bash
+cd ~/Dropbox/work/MyTools
+git clone https://github.com/tarkansarim/Agent-Terminal-Contact.git
+cd Agent-Terminal-Contact
+bash scripts/install.sh --force
+bash scripts/install.sh --check
+```
+
 ## Layout
 
 ```

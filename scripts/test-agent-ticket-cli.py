@@ -2279,6 +2279,9 @@ class AgentTicketCliTests(unittest.TestCase):
             "agent-ticket supervise 42 --full-permission",
             "agent-ticket closeout-check 42 --strict",
             "agent-ticket callbacks --pending --repo <repo>",
+            "## Onboarding Dependency Check",
+            "agent-contact artifact-info --all --json",
+            "git clone https://github.com/tarkansarim/Agent-Terminal-Contact.git",
         ):
             self.assertIn(body_detail, body)
 
