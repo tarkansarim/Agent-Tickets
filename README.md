@@ -1,9 +1,9 @@
 # agent-tickets
 
 `agent-tickets` is a local cross-repo dependency management and agent
-coordination system. It is built for environments where many repositories work
-together tightly, each repo may have its own owner agent, and work often crosses
-repo boundaries.
+coordination system for Claude Code and Codex agents. It is built for
+environments where many repositories work together tightly, each repo may have
+its own owner agent, and work often crosses repo boundaries.
 
 Use it when one repo's agent needs another repo's agent to fix a bug, implement
 a supporting feature, repair setup/docs, investigate an integration break, or
@@ -57,9 +57,11 @@ Hard runtime dependencies:
 - `kanboard/kanboard:v1.2.52`, started locally by `docker-compose.yml`
 - A Kanboard application API token in `~/.config/agent-tickets/config.json`
 
-Optional coordination dependency:
+Coordination dependency:
 
-- `AgentTerminalContact`, which provides:
+- [`Agent-Terminal-Contact`](https://github.com/tarkansarim/Agent-Terminal-Contact),
+  which should be installed alongside `agent-tickets` for cross-repo agent
+  coordination. It provides:
   - `agent-contact`: guarded cross-agent messaging for dispatch, callbacks, and
     safety checks.
   - `agent-tmux`: deterministic Codex/Claude worker launch and session discovery
@@ -67,10 +69,10 @@ Optional coordination dependency:
 - Repo roots configured in `repo_roots`, defaulting to `~/Dropbox/work/MyTools`,
   so `project:<repo-name>` tickets can resolve to source repo paths.
 
-Without `agent-contact`/`agent-tmux`, normal ticket filing, listing, comments,
+Without `Agent-Terminal-Contact`, normal ticket filing, listing, comments,
 moves, closes, and Kanboard board operations still work. Cross-repo owner-agent
-handoff and supervision need those tools on `PATH` and trusted-root environment
-variables configured.
+handoff, callbacks, and supervision need `agent-contact`/`agent-tmux` on `PATH`
+and trusted-root environment variables configured.
 
 ## Layout
 
