@@ -1,5 +1,11 @@
 # agent-tickets
 
+Recommended setup path: let your Claude Code or Codex coding agent drive this
+from the start. The installer touches local agent hooks, user-level CLI paths,
+Kanboard API configuration, and the companion Agent-Terminal-Contact dependency;
+an agent can check those pieces, run the right installer for your OS, and
+escalate when a prerequisite needs your approval.
+
 `agent-tickets` is a local cross-repo dependency management and agent
 coordination system for Claude Code and Codex agents. It is built for
 environments where many repositories work together tightly, each repo may have
