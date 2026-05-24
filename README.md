@@ -35,26 +35,35 @@ For portability/backup, periodically copy `~/kanboard-data/data/db.sqlite` somew
 
 ## Quick Start
 
-Supported install targets:
+Install target:
 
-- Linux with Bash, Python 3, Docker, and the Docker Compose plugin.
-- Windows via WSL. Run the same commands inside the WSL distro; native Windows/PowerShell install is not currently implemented.
+- Linux, or Windows through WSL.
 
-There is no Python virtualenv or `pip install` step for this repo. The CLI and installer use Python 3 standard-library modules only; Kanboard runs in Docker.
+Prerequisites:
 
-On a new machine:
+- Python 3
+- Docker with the Docker Compose plugin
+- `~/.local/bin` on your shell `PATH`
+
+There is no virtualenv and no `pip install` step.
+
+Install:
 
 ```bash
-cd /path/to/agent-tickets   # cloned repo, or the MyTools copy
+git clone <repo-url> agent-tickets
+cd agent-tickets
 ./install.sh
 ```
 
-The first run installs the CLI/config/hook files and, when Docker is available, starts Kanboard at `http://localhost:8765`. It intentionally stops before board bootstrap until a real Kanboard application API token is configured. Then:
+Finish first-time setup:
 
-1. open http://localhost:8765 — log in `admin` / `admin`, **change the password**
-2. **Settings → API** → copy the API token into `~/.config/agent-tickets/config.json`
-3. re-run `./install.sh` (or just `python3 bootstrap-board.py`) — this creates the "Agent Tickets" project, the columns, the categories, and writes `project_id` into the config
-4. `agent-ticket columns` — smoke test
+1. Open `http://localhost:8765`.
+2. Log in with `admin` / `admin`.
+3. Change the password.
+4. Go to **Settings → API**.
+5. Copy the API token into `~/.config/agent-tickets/config.json`.
+6. Run `./install.sh` again.
+7. Run `agent-ticket columns`.
 
 Successful setup should show:
 
@@ -66,25 +75,23 @@ Successful setup should show:
 5. Done
 ```
 
-Make sure `~/.local/bin` is on your shell `PATH`; `install.sh` prints a note if it is not.
+Use it:
 
-`install.sh` and `bootstrap-board.py` are both idempotent; re-run `install.sh` any time to push source edits (it re-copies the CLI/skill/compose and re-bootstraps; it never overwrites your real `config.json`). The `.gitignore` keeps `data/`, `backups/`, `config.json`, and `*.sqlite` out of git, so a clone carries no secrets or DB.
+```bash
+agent-ticket new --title "..." --kind bug --severity p2 --project <repo-name> --agent codex --body "What happened"
+agent-ticket list
+agent-ticket show <id>
+agent-ticket comment <id> "Evidence or update"
+agent-ticket close <id>
+```
 
-To emulate a brand-new user home before rolling out:
+Re-run `./install.sh` after source updates. It overwrites installed code/docs, but it does not overwrite your real `~/.config/agent-tickets/config.json`.
+
+Installer smoke test for maintainers:
 
 ```bash
 scripts/smoke-fresh-install.sh linux-no-docker
 ```
-
-That smoke test runs `install.sh` with a temporary `HOME` and a restricted `PATH` that deliberately omits Docker, then verifies the fresh bootstrap artifacts: copied CLI, config directory permissions, compose file, notify hook, source manifest, `.env`, placeholder-token `config.json`, and the expected "install Docker / re-run" onboarding stop. It does not touch the real `~/.config`, `~/.local/bin`, skills, hooks, Kanboard container, or Kanboard data.
-
-For Windows onboarding, the supported route for this Bash installer is WSL:
-
-```bash
-scripts/smoke-fresh-install.sh wsl-no-docker
-```
-
-Run that command inside the target WSL distribution. Native Windows/PowerShell install is not currently implemented by this repo.
 
 To verify installed artifacts before editing or rolling out:
 
