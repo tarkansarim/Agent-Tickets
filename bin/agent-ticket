@@ -3561,6 +3561,18 @@ def cmd_supervise(cfg, args):
                                       "ticket is in Needs human; supervisor should not auto-route it", args.id)
         out(args, result, "supervise #%s blocked: %s" % (args.id, result["reason"]))
         return
+    if (not _task_is_active(t)) or col == "Done":
+        result = {
+            "ok": True,
+            "status": "already done",
+            "reason": "ticket already closed",
+            "ticket": int(args.id),
+            "column": col,
+        }
+        if getattr(args, "dry_run", False):
+            result["dry_run"] = True
+        out(args, result, "supervise #%s skipped: ticket already closed (%s)" % (args.id, col))
+        return
 
     supervision_preflight = _supervision_preflight(args, repo, [args.id])
     if supervision_preflight["blocked"]:

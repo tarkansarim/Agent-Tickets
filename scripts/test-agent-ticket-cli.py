@@ -980,6 +980,74 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-53"]], tmux_calls)
         audit.assert_not_called()
 
+    def test_supervise_closed_ticket_skips_without_contact_or_blocker(self):
+        task = {"id": 54, "title": "Already closed", "column_id": 5, "swimlane_id": 1, "is_active": 0}
+        args = argparse.Namespace(
+            id=54, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=True, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Done"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["dry_run"])
+        self.assertEqual("already done", result["status"])
+        self.assertEqual("Done", result["column"])
+        contact.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_inactive_ticket_in_stale_live_column_skips_without_contact(self):
+        task = {"id": 57, "title": "Closed but stale column", "column_id": 3, "swimlane_id": 1, "is_active": 0}
+        args = argparse.Namespace(
+            id=57, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=False, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Agent working"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertNotIn("dry_run", result)
+        self.assertEqual("already done", result["status"])
+        self.assertEqual("Agent working", result["column"])
+        contact.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
     def test_supervise_explicit_missing_tmux_window_launches_without_unsafe_refusal(self):
         task = {"id": 55, "title": "Fix absent exact tmux window", "column_id": 2, "swimlane_id": 1, "is_active": 1}
         tmux_calls = []
