@@ -57,12 +57,13 @@ Hard runtime dependencies:
 - `kanboard/kanboard:v1.2.52`, started locally by `docker-compose.yml`
 - A Kanboard application API token in `~/.config/agent-tickets/config.json`
 
-Optional coordination dependencies:
+Optional coordination dependency:
 
-- `agent-contact`: guarded cross-agent messaging for dispatch, callbacks, and
-  safety checks.
-- `agent-tmux`: deterministic Codex/Claude worker launch and session discovery
-  for `supervise` and `supervise-batch`.
+- `AgentTerminalContact`, which provides:
+  - `agent-contact`: guarded cross-agent messaging for dispatch, callbacks, and
+    safety checks.
+  - `agent-tmux`: deterministic Codex/Claude worker launch and session discovery
+    wrapper used by `supervise` and `supervise-batch`.
 - Repo roots configured in `repo_roots`, defaulting to `~/Dropbox/work/MyTools`,
   so `project:<repo-name>` tickets can resolve to source repo paths.
 
