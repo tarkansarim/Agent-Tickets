@@ -33,23 +33,42 @@ After install, the *live* system is entirely under `~/.local/bin`, `~/.claude/sk
 
 For portability/backup, periodically copy `~/kanboard-data/data/db.sqlite` somewhere safe (you could keep copies in `agent-tickets/backups/`, which `.gitignore` excludes from git but Dropbox will still sync — fine for a *static* copy, not the live file).
 
-## Roll out on a (new) machine
+## Quick Start
 
-Needs: Docker, Python 3, and `~/.local/bin` on your PATH.
+Supported install targets:
+
+- Linux with Bash, Python 3, Docker, and the Docker Compose plugin.
+- Windows via WSL. Run the same commands inside the WSL distro; native Windows/PowerShell install is not currently implemented.
+
+There is no Python virtualenv or `pip install` step for this repo. The CLI and installer use Python 3 standard-library modules only; Kanboard runs in Docker.
+
+On a new machine:
 
 ```bash
 cd /path/to/agent-tickets   # cloned repo, or the MyTools copy
 ./install.sh
 ```
-First run brings Kanboard up but stops there (no token yet). Then:
+
+The first run installs the CLI/config/hook files and, when Docker is available, starts Kanboard at `http://localhost:8765`. It intentionally stops before board bootstrap until a real Kanboard application API token is configured. Then:
+
 1. open http://localhost:8765 — log in `admin` / `admin`, **change the password**
 2. **Settings → API** → copy the API token into `~/.config/agent-tickets/config.json`
 3. re-run `./install.sh` (or just `python3 bootstrap-board.py`) — this creates the "Agent Tickets" project, the columns, the categories, and writes `project_id` into the config
 4. `agent-ticket columns` — smoke test
 
-`install.sh` and `bootstrap-board.py` are both idempotent; re-run `install.sh` any time to push source edits (it re-copies the CLI/skill/compose and re-bootstraps; it never overwrites your real `config.json`). The `.gitignore` keeps `data/`, `backups/`, `config.json`, and `*.sqlite` out of git, so a clone carries no secrets or DB.
+Successful setup should show:
 
-This repo does not use a Python virtualenv for the CLI or installer. Runtime code uses Python 3 standard-library modules plus Docker/Kanboard; there is no `pip install` step unless future source changes add a real dependency.
+```text
+1. New
+2. Triaging
+3. Agent working
+4. Needs human
+5. Done
+```
+
+Make sure `~/.local/bin` is on your shell `PATH`; `install.sh` prints a note if it is not.
+
+`install.sh` and `bootstrap-board.py` are both idempotent; re-run `install.sh` any time to push source edits (it re-copies the CLI/skill/compose and re-bootstraps; it never overwrites your real `config.json`). The `.gitignore` keeps `data/`, `backups/`, `config.json`, and `*.sqlite` out of git, so a clone carries no secrets or DB.
 
 To emulate a brand-new user home before rolling out:
 
