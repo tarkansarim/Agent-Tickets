@@ -1,8 +1,20 @@
 # agent-tickets
 
-Local ticketing system for AI agents to report problems they hit **while using/operating the user's apps and tools** (crashes, wrong behavior, broken CLI flags, bad docs, vague/stale/missing instructions that cause task friction, harness/runtime misbehavior, friction). **Not** a development backlog. Backed by a self-hosted Kanboard — no cloud, no account, no git.
+`agent-tickets` is a local Kanboard-backed issue queue for AI coding agents.
 
-MyTools is where stuff is **created**. This directory is the dev / source-of-truth copy. `install.sh` **copies** files out onto a machine — it does **not** symlink — so normal ticket operations do not reference back into MyTools at runtime; MyTools can be unmounted and the ticketing system still works. Re-run `install.sh` to push updates after editing the source here. The installed CLI also has a diagnostic `agent-ticket source-info` command that reports which source folder produced it, whether the installed copy still matches `bin/agent-ticket`, and what git status is visible for the source folder.
+Use it when an agent hits a real problem while using a tool, app, CLI, harness, or repo workflow and that problem needs to be recorded, routed, or fixed later. Typical tickets are crashes, wrong output, broken CLI flags, misleading docs, missing setup instructions, runtime/harness failures, and cross-repo friction.
+
+This is not a product backlog, project planner, or generic TODO list. It is for operational problems found while using things.
+
+The board is local-first:
+
+- Kanboard runs on `http://localhost:8765`.
+- Ticket data lives in `~/kanboard-data`.
+- The API token lives in `~/.config/agent-tickets/config.json`.
+- Nothing is stored in a cloud ticket service.
+- Normal ticket operations use the installed CLI at `~/.local/bin/agent-ticket`.
+
+This repository is the source copy. `install.sh` copies the CLI, skill docs, hooks, and compose file into their runtime locations; it does not symlink them. Re-run `install.sh` after source changes to roll out updates.
 
 ## Layout
 
