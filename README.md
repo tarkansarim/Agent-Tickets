@@ -17,6 +17,7 @@ agent-tickets/                          # <- dev / source of truth (this folder,
   scripts/notify-hook.sh        # agent-neutral hook: surfaces open tickets for the repo the agent is in -> ~/.config/agent-tickets/notify-hook.sh
   scripts/register-hooks.py     # idempotently wires notify-hook.sh into ~/.claude/settings.json and ~/.codex/hooks.json
   scripts/check-kanboard-version.sh   # compares the pinned Kanboard image tag against the latest release
+  scripts/smoke-fresh-install.sh      # isolated fresh-HOME installer smoke test for Linux/WSL onboarding
   README.md               # this file
   DECISIONS.md            # design history / rationale
   .gitignore              # if ever git-tracked: never commit data/ or the real config
@@ -47,6 +48,24 @@ First run brings Kanboard up but stops there (no token yet). Then:
 4. `agent-ticket columns` — smoke test
 
 `install.sh` and `bootstrap-board.py` are both idempotent; re-run `install.sh` any time to push source edits (it re-copies the CLI/skill/compose and re-bootstraps; it never overwrites your real `config.json`). The `.gitignore` keeps `data/`, `backups/`, `config.json`, and `*.sqlite` out of git, so a clone carries no secrets or DB.
+
+This repo does not use a Python virtualenv for the CLI or installer. Runtime code uses Python 3 standard-library modules plus Docker/Kanboard; there is no `pip install` step unless future source changes add a real dependency.
+
+To emulate a brand-new user home before rolling out:
+
+```bash
+scripts/smoke-fresh-install.sh linux-no-docker
+```
+
+That smoke test runs `install.sh` with a temporary `HOME` and a restricted `PATH` that deliberately omits Docker, then verifies the fresh bootstrap artifacts: copied CLI, config directory permissions, compose file, notify hook, source manifest, `.env`, placeholder-token `config.json`, and the expected "install Docker / re-run" onboarding stop. It does not touch the real `~/.config`, `~/.local/bin`, skills, hooks, Kanboard container, or Kanboard data.
+
+For Windows onboarding, the supported route for this Bash installer is WSL:
+
+```bash
+scripts/smoke-fresh-install.sh wsl-no-docker
+```
+
+Run that command inside the target WSL distribution. Native Windows/PowerShell install is not currently implemented by this repo.
 
 To verify installed artifacts before editing or rolling out:
 
