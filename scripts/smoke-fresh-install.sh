@@ -15,13 +15,13 @@ that contains no docker executable. This validates the fresh-machine bootstrap
 path up to the point where Docker/Kanboard credentials are required:
 
   - CLI copied to ~/.local/bin
+  - Claude/Codex skills and notify hooks installed even when provider dirs are absent
   - config directory, compose file, notify hook, source manifest, and .env written
   - config.json created with placeholder API token and mode 0600
   - installer exits cleanly with the Docker prerequisite note
 
-The wsl-no-docker lane is the supported Windows onboarding lane for this Bash
-installer: run it inside WSL. Native Windows/PowerShell install is not currently
-implemented by this repo.
+The wsl-no-docker lane validates this Bash installer inside WSL. Native Windows
+uses install-windows.bat / scripts/install-windows.ps1.
 EOF
 }
 
@@ -97,6 +97,10 @@ def require_file(path, mode=None):
 
 cfg_dir = home / ".config" / "agent-tickets"
 require_file(home / ".local" / "bin" / "agent-ticket", 0o755)
+require_file(home / ".claude" / "skills" / "agent-tickets" / "SKILL.md", 0o644)
+require_file(home / ".codex" / "skills" / "agent-tickets" / "SKILL.md", 0o644)
+require_file(home / ".claude" / "settings.json")
+require_file(home / ".codex" / "hooks.json")
 require_file(cfg_dir / "docker-compose.yml", 0o644)
 require_file(cfg_dir / "notify-hook.sh", 0o755)
 require_file(cfg_dir / "source.json", 0o644)
@@ -120,6 +124,35 @@ if Path(source.get("source_dir", "")).resolve() != root:
     fail("source manifest source_dir does not point at repo root")
 if not source.get("installed_cli_sha256"):
     fail("source manifest did not hash installed CLI")
+if not source.get("installed_claude_skill_sha256"):
+    fail("source manifest did not hash installed Claude skill")
+if not source.get("installed_codex_skill_sha256"):
+    fail("source manifest did not hash installed Codex skill")
+
+claude_settings = json.loads((home / ".claude" / "settings.json").read_text())
+claude_hooks = claude_settings.get("hooks", {})
+claude_commands = [
+    hook.get("command", "")
+    for event in ("SessionStart", "UserPromptSubmit")
+    for group in claude_hooks.get(event, [])
+    for hook in group.get("hooks", [])
+]
+if not any(command.endswith("notify-hook.sh baseline") for command in claude_commands):
+    fail("Claude SessionStart notify hook was not registered")
+if not any(command.endswith("notify-hook.sh changes") for command in claude_commands):
+    fail("Claude UserPromptSubmit notify hook was not registered")
+
+codex_hooks = json.loads((home / ".codex" / "hooks.json").read_text()).get("hooks", {})
+codex_commands = [
+    hook.get("command", "")
+    for event in ("SessionStart", "Stop")
+    for group in codex_hooks.get(event, [])
+    for hook in group.get("hooks", [])
+]
+if not any(command.endswith("notify-hook.sh baseline") for command in codex_commands):
+    fail("Codex SessionStart notify hook was not registered")
+if not any(command.endswith("notify-hook.sh codex-stop-changes") for command in codex_commands):
+    fail("Codex Stop notify hook was not registered")
 
 env_text = (cfg_dir / ".env").read_text()
 if "KANBOARD_DATA_DIR=" not in env_text or str(home / "kanboard-data") not in env_text:

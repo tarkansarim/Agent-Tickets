@@ -89,11 +89,9 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "    NOTE: add ~/.local/bin
 
 # --- 2. Skill -> agent skills dirs (real copy). Same SKILL.md works for both Claude Code and Codex. ---
 for SKILLS_ROOT in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
-  if [ -d "$(dirname "$SKILLS_ROOT")" ]; then
-    mkdir -p "$SKILLS_ROOT/agent-tickets"
-    install -m 0644 "$DIR/skill/SKILL.md" "$SKILLS_ROOT/agent-tickets/SKILL.md"
-    echo "    installed $SKILLS_ROOT/agent-tickets/SKILL.md"
-  fi
+  mkdir -p "$SKILLS_ROOT/agent-tickets"
+  install -m 0644 "$DIR/skill/SKILL.md" "$SKILLS_ROOT/agent-tickets/SKILL.md"
+  echo "    installed $SKILLS_ROOT/agent-tickets/SKILL.md"
 done
 
 # --- 3. Config dir (holds the API token): real config + compose file + .env + notify hook live here ---

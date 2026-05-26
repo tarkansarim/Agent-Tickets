@@ -434,6 +434,31 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("python3 rewind.py", stop_commands)
         self.assertNotIn("%s changes" % hook, stop_commands)
 
+    def test_register_hooks_creates_claude_settings_on_fresh_home(self):
+        home = pathlib.Path(self.tmpdir.name) / "fresh-home"
+        hook = pathlib.Path(self.tmpdir.name) / "notify-hook.sh"
+        hook.write_text("#!/bin/sh\n")
+
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "register-hooks.py"), str(hook)],
+            env={**os.environ, "HOME": str(home)},
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        settings_path = home / ".claude" / "settings.json"
+        self.assertTrue(settings_path.is_file())
+        data = json.loads(settings_path.read_text())
+        commands = [
+            h["command"]
+            for event in ("SessionStart", "UserPromptSubmit")
+            for group in data["hooks"].get(event, [])
+            for h in group.get("hooks", [])
+        ]
+        self.assertIn("%s baseline" % hook, commands)
+        self.assertIn("%s changes" % hook, commands)
+
     def test_supervise_dry_run_launches_fresh_without_trusting_stale_latest(self):
         task = {"id": 47, "title": "Fix demo", "column_id": 1, "swimlane_id": 1, "is_active": 1}
         tmux_calls = []
@@ -2324,6 +2349,9 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("Usage: install-windows.bat", ps1)
         self.assertIn("Docker Desktop", ps1)
         self.assertIn("agent-ticket.cmd", ps1)
+        self.assertIn('.claude\\skills', ps1)
+        self.assertIn('.codex\\skills', ps1)
+        self.assertNotIn("Test-Path $providerHome", ps1)
         self.assertIn("install-windows.bat", readme)
         self.assertIn('MARKER = "notify-hook"', register_hooks)
 

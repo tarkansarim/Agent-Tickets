@@ -94,8 +94,6 @@ def _save(path, data):
 
 def register_claude():
     path = os.path.expanduser("~/.claude/settings.json")
-    if not os.path.isdir(os.path.dirname(path)):
-        print("  claude: ~/.claude not present — skipped"); return
     data = _load(path)
     hooks = data.setdefault("hooks", {})
     changed = _ensure(hooks, "SessionStart", "baseline")

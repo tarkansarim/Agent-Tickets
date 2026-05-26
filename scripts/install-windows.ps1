@@ -113,14 +113,11 @@ if (($env:PATH -split ";") -notcontains $BinDir) {
 }
 
 foreach ($skillsRoot in @((Join-Path $HomeDir ".claude\skills"), (Join-Path $HomeDir ".codex\skills"))) {
-    $providerHome = Split-Path -Parent $skillsRoot
-    if (Test-Path $providerHome) {
-        $dest = Join-Path $skillsRoot "agent-tickets"
-        New-Item -ItemType Directory -Force -Path $dest | Out-Null
-        $skillDest = Join-Path $dest "SKILL.md"
-        Copy-Item -Force (Join-Path $Root "skill\SKILL.md") $skillDest
-        Write-Host "    installed $skillDest"
-    }
+    $dest = Join-Path $skillsRoot "agent-tickets"
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    $skillDest = Join-Path $dest "SKILL.md"
+    Copy-Item -Force (Join-Path $Root "skill\SKILL.md") $skillDest
+    Write-Host "    installed $skillDest"
 }
 
 $ComposeDest = Join-Path $CfgDir "docker-compose.yml"
