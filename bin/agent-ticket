@@ -1898,6 +1898,18 @@ def _owner_agent_routing_prompt(cfg, task_id, tags, column):
     if not repo:
         prompt["reason"] = "unresolved repo"
         return prompt
+    current_repo = _current_origin_repo()
+    if os.path.realpath(current_repo) == os.path.realpath(repo):
+        prompt.update({
+            "repo": repo,
+            "reason": "current repo owns ticket; fix in-place",
+            "safety": (
+                "The active agent is already in the owning repo. Move the ticket to "
+                "'Agent working', fix from source in this chat, validate, comment evidence, "
+                "and close it instead of dispatching or supervising another worker."
+            ),
+        })
+        return prompt
 
     prompt.update({
         "ask_user": True,
@@ -2666,6 +2678,10 @@ def _contact_missing_tmux_server_socket(reason):
     return match.group("socket").strip().strip("'\"") or None
 
 
+def _contact_no_current_target(reason):
+    return bool(re.search(r"\bno current target\b", reason or "", re.IGNORECASE))
+
+
 def _contact_refusal_is_codex_starter_placeholder(refusal, expected_session=None):
     if (refusal or {}).get("provider") != "codex" or not expected_session:
         return False
@@ -2689,6 +2705,8 @@ def _batch_refusal_is_safe_absence(refusal, expected_repo=None, expected_session
     reason = str(refusal.get("reason") or payload.get("reason") or payload.get("pane_reason") or probe.get("stderr") or "")
     if expected_session is not None and _contact_missing_window_session(reason) == str(expected_session):
         return True
+    if expected_session is not None and _contact_no_current_target(reason):
+        return True
     if _contact_missing_tmux_server_socket(reason):
         return True
     reported_repo = _batch_contact_absence_repo(reason)
@@ -2701,6 +2719,41 @@ def _batch_refusal_is_safe_absence(refusal, expected_repo=None, expected_session
 
 def _batch_unsafe_contact_refusals(refusals, expected_repo=None, expected_session=None):
     return [r for r in refusals if not _batch_refusal_is_safe_absence(r, expected_repo, expected_session)]
+
+
+def _safe_absence_refusals(refusals, expected_repo=None, expected_session=None):
+    return [r for r in refusals if _batch_refusal_is_safe_absence(r, expected_repo, expected_session)]
+
+
+def _public_refusal_summary(refusals):
+    return [
+        {
+            "provider": r.get("provider"),
+            "reason": r.get("reason"),
+        }
+        for r in refusals or []
+    ]
+
+
+def _supervise_first_contact_plan(route, absence_refusals=None):
+    route = route or {}
+    if route.get("mode") != "launch":
+        return None
+    session = route.get("session")
+    repo = route.get("repo")
+    return {
+        "status": "planned",
+        "reason": "no existing ticket-scoped owner lane was found; first contact is a fresh Codex launch",
+        "provider": "codex",
+        "session": session,
+        "repo": repo,
+        "command": "agent-tmux codex %s %s%s <message>" % (
+            session,
+            repo,
+            " -s danger-full-access -a never" if route.get("full_permission") else "",
+        ),
+        "safe_absence_refusals": _public_refusal_summary(absence_refusals),
+    }
 
 
 def _batch_tmux_text(result):
@@ -3658,6 +3711,7 @@ def cmd_supervise(cfg, args):
     selected = None
     route = {"repo": repo, "project": pname, "ticket": args.id, "initial_column": col}
 
+    absence_refusals = _safe_absence_refusals(refused, repo, expected_session=session)
     unsafe_refusals = _batch_unsafe_contact_refusals(refused, repo, expected_session=session)
     if unsafe_refusals:
         result = _supervision_blocked(
@@ -3795,6 +3849,11 @@ def cmd_supervise(cfg, args):
     if args.dry_run:
         result = {"ok": True, "dry_run": True, "route": route, "refused": refused}
         result["supervision"] = supervision_preflight
+        if absence_refusals:
+            result["absence_refusals"] = _public_refusal_summary(absence_refusals)
+        first_contact = _supervise_first_contact_plan(route, absence_refusals=absence_refusals)
+        if first_contact:
+            result["first_contact"] = first_contact
         if watcher_preview:
             result["watcher"] = watcher_preview
         note = _supervise_route_note(route)

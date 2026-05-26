@@ -2123,6 +2123,40 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("agent-ticket dispatch 70", commands)
         self.assertIn("agent-ticket supervise 70 --full-permission", commands)
 
+    def test_new_without_dispatch_in_current_owner_repo_does_not_prompt_routing(self):
+        args = argparse.Namespace(
+            project="demo", force=True, watch_origin=False, dispatch=False, tag=None, agent="codex",
+            severity="p2", title="Demo issue", column="New", body="body", kind="bug", json=True,
+        )
+        task = {"id": 71, "title": "Demo issue", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+
+        def fake_rpc(cfg, method, params=None):
+            if method == "createTask":
+                return 71
+            if method == "getTask":
+                return task
+            self.fail("unexpected rpc call %s" % method)
+
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "resolve_column_id", return_value=1), \
+             mock.patch.object(self.cli, "resolve_category_id", return_value=2), \
+             mock.patch.object(self.cli, "rpc", side_effect=fake_rpc), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo", "agent:codex", "p2"]), \
+             mock.patch.object(self.cli, "resolve_repo_path", return_value="/tmp/demo"), \
+             mock.patch.object(self.cli, "_current_origin_repo", return_value="/tmp/demo"), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_new({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://kanboard.invalid/jsonrpc.php",
+            }, args)
+
+        prompt = json.loads(out.getvalue())["owner_agent_routing_prompt"]
+        self.assertFalse(prompt["ask_user"])
+        self.assertEqual("current repo owns ticket; fix in-place", prompt["reason"])
+        self.assertEqual([], prompt["approved_routes"])
+        self.assertIn("Agent working", prompt["safety"])
+
     def test_concurrent_watcher_registrations_preserve_both_tickets(self):
         def register(ticket_id):
             args = argparse.Namespace(
@@ -3193,6 +3227,75 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertTrue(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo", "owner-demo-53"))
         self.assertTrue(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/other", "other-demo"))
         self.assertFalse(self.cli._batch_refusal_is_safe_absence(permission_refusal, "/tmp/demo", "owner-demo-53"))
+
+    def test_contact_no_current_target_is_safe_absence_for_exact_ticket_session(self):
+        refusal = {
+            "provider": "codex",
+            "reason": "tmux pane discovery failed: no current target",
+            "probe": {"json": {"reason": "tmux pane discovery failed: no current target"}},
+        }
+
+        self.assertTrue(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo", "owner-demo-53"))
+        self.assertFalse(self.cli._batch_refusal_is_safe_absence(refusal, "/tmp/demo"))
+
+    def test_supervise_dry_run_reports_first_contact_plan_for_no_owner_pane(self):
+        task = {"id": 116, "title": "Fix first contact path", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        tmux_calls = []
+
+        def fake_contact(repo, provider, message, dry_run=False, session=None):
+            return {
+                "ok": False,
+                "rc": 3,
+                "json": {"reason": "tmux pane discovery failed: no current target"},
+                "stderr": "",
+                "raw": "",
+            }
+
+        def fake_tmux(argv, timeout=25):
+            tmux_calls.append(argv)
+            if argv[0] == "codex-existing":
+                return {
+                    "ok": False,
+                    "rc": 1,
+                    "stdout": "",
+                    "stderr": "agent-tmux: no Codex tmux session found for workdir: /tmp/demo; session: owner-demo-116",
+                    "argv": ["agent-tmux"] + argv,
+                }
+            self.fail("dry-run should not launch")
+
+        args = argparse.Namespace(
+            id=116, provider=None, session=None, session_prefix="owner", full_permission=True,
+            message="", dry_run=True, no_tool_ticket=True, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact", side_effect=fake_contact), \
+             mock.patch.object(self.cli, "_agent_tmux", side_effect=fake_tmux), \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertEqual("launch", result["route"]["mode"])
+        self.assertEqual("planned", result["first_contact"]["status"])
+        self.assertIn("fresh Codex launch", result["first_contact"]["reason"])
+        self.assertIn("agent-tmux codex owner-demo-116 /tmp/demo -s danger-full-access -a never", result["first_contact"]["command"])
+        self.assertEqual(2, len(result["absence_refusals"]))
+        self.assertNotIn("unsafe provider refusal", json.dumps(result))
+        self.assertEqual([["codex-existing", "/tmp/demo", "owner-demo-116"]], tmux_calls)
+        audit.assert_not_called()
 
     def test_supervise_batch_does_not_query_latest_when_launching_fresh(self):
         group = {"project": "demo", "repo": "/tmp/demo", "tickets": []}

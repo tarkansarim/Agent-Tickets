@@ -77,6 +77,7 @@ Re-run `install.sh` after source changes to roll out updates.
 Recent changes:
 
 - `2026-05-26` — Serialized same-repo single-ticket supervision and clarified polling-limit output.
+- `2026-05-26` — Clarified same-repo owner tickets as in-place work and added first-contact dry-run evidence for supervised launches.
 - `bb15d02` — Clarified Claude install policy and hardened ticket skill discovery for natural repo-agent ticket requests.
 - `cc03512` — Added fresh-home Claude install coverage for the installer and hooks.
 - `8c31b8b` — Replaced the README banner with the correct JPG asset.
