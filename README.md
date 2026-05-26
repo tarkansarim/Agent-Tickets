@@ -1,4 +1,4 @@
-![Agent Tickets banner](assets/agent-tickets-banner.png)
+![Agent Tickets banner](assets/agent-tickets-banner.jpg)
 
 # Agent Tickets
 
