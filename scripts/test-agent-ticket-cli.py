@@ -434,8 +434,26 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("python3 rewind.py", stop_commands)
         self.assertNotIn("%s changes" % hook, stop_commands)
 
-    def test_register_hooks_creates_claude_settings_on_fresh_home(self):
+    def test_register_hooks_skips_claude_when_provider_home_absent(self):
         home = pathlib.Path(self.tmpdir.name) / "fresh-home"
+        hook = pathlib.Path(self.tmpdir.name) / "notify-hook.sh"
+        hook.write_text("#!/bin/sh\n")
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "register-hooks.py"), str(hook)],
+            env={**os.environ, "HOME": str(home)},
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        settings_path = home / ".claude" / "settings.json"
+        self.assertFalse(settings_path.exists())
+        self.assertIn("claude: ~/.claude not present", result.stdout)
+
+    def test_register_hooks_creates_claude_settings_when_provider_home_exists(self):
+        home = pathlib.Path(self.tmpdir.name) / "home-with-claude"
+        (home / ".claude").mkdir(parents=True)
         hook = pathlib.Path(self.tmpdir.name) / "notify-hook.sh"
         hook.write_text("#!/bin/sh\n")
 
@@ -448,7 +466,7 @@ class AgentTicketCliTests(unittest.TestCase):
         )
 
         settings_path = home / ".claude" / "settings.json"
-        self.assertTrue(settings_path.is_file())
+        self.assertTrue(settings_path.exists())
         data = json.loads(settings_path.read_text())
         commands = [
             h["command"]
@@ -2351,7 +2369,8 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIn("agent-ticket.cmd", ps1)
         self.assertIn('.claude\\skills', ps1)
         self.assertIn('.codex\\skills', ps1)
-        self.assertNotIn("Test-Path $providerHome", ps1)
+        self.assertIn("Test-Path $providerHome", ps1)
+        self.assertIn("skipped $skillDest", ps1)
         self.assertIn("install-windows.bat", readme)
         self.assertIn('MARKER = "notify-hook"', register_hooks)
 

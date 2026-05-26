@@ -1,6 +1,6 @@
 ---
 name: agent-tickets
-description: "Use for local agent-ticket Kanboard workflows: file/report/open/log tickets, check/list/show open tickets, dispatch or supervise owner agents, closeout-check tickets, and callbacks."
+description: "Use for agent-ticket workflows: file a ticket to another repo or repo-owner agent, check/list/show tickets, dispatch/supervise owner agents, closeout-check tickets, callbacks."
 ---
 
 # Agent Tickets
@@ -9,7 +9,7 @@ A **local Kanboard** at **http://localhost:8765** is the shared queue for proble
 
 ## Discovery Triggers
 
-Load this skill when the user or current task asks to file, report, open, log, check, list, show, dispatch, supervise, closeout-check, close, reopen, route, drain, or callback an agent ticket. Also load it for test/report-mode subagents, owner-agent ticket inbox work, local Kanboard ticket board checks, and agent-contact/tmux ticket supervision handoffs.
+Load this skill when the user or current task asks to file, create, report, open, log, check, list, show, dispatch, supervise, closeout-check, close, reopen, route, drain, or callback an agent ticket. Also load it for natural requests like "file a ticket to the Pressure-Lab agent", "open a ticket for the <repo> owner agent", "route this to the <repo> agent", "tell the <repo> agent about this bug", test/report-mode subagents, owner-agent ticket inbox work, local Kanboard ticket board checks, and agent-contact/tmux ticket supervision handoffs.
 
 Representative routes: `agent-ticket new`, `agent-ticket list`, `agent-ticket dispatch <id>`, `agent-ticket supervise <id>`, `agent-ticket closeout-check <id>`, and `agent-ticket callbacks`.
 

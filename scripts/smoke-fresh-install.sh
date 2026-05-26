@@ -15,7 +15,8 @@ that contains no docker executable. This validates the fresh-machine bootstrap
 path up to the point where Docker/Kanboard credentials are required:
 
   - CLI copied to ~/.local/bin
-  - Claude/Codex skills and notify hooks installed even when provider dirs are absent
+  - Claude/Codex skills and notify hooks installed when provider dirs are present
+  - absent provider dirs are reported as explicit skips, not silently ignored
   - config directory, compose file, notify hook, source manifest, and .env written
   - config.json created with placeholder API token and mode 0600
   - installer exits cleanly with the Docker prerequisite note
@@ -70,6 +71,7 @@ run_no_docker_lane() {
   done
 
   echo "==> $label: isolated HOME=$temp_home"
+  mkdir -p "$temp_home/.claude" "$temp_home/.codex"
   echo "==> $label: running install.sh with docker intentionally absent from PATH"
   HOME="$temp_home" PATH="$temp_bin" "$ROOT/install.sh" | tee "$log_file"
 
@@ -170,8 +172,56 @@ PY
   echo "==> $label: ok"
 }
 
+run_no_provider_lane() {
+  local label="$1"
+  local temp_home temp_bin log_file
+  temp_home="$(mktemp -d "/tmp/agent-tickets-${label}.home.XXXXXX")"
+  temp_bin="$(mktemp -d "/tmp/agent-tickets-${label}.bin.XXXXXX")"
+  log_file="$temp_home/install.log"
+
+  cleanup() {
+    rm -rf "$temp_home" "$temp_bin"
+  }
+  trap cleanup RETURN
+
+  for cmd in bash python3 dirname mkdir install chmod git; do
+    require_cmd "$cmd"
+    ln -s "$(command -v "$cmd")" "$temp_bin/$cmd"
+  done
+
+  echo "==> $label: isolated HOME=$temp_home"
+  echo "==> $label: running install.sh without provider config directories"
+  HOME="$temp_home" PATH="$temp_bin" "$ROOT/install.sh" | tee "$log_file"
+
+  HOME="$temp_home" PATH="$temp_bin" python3 - "$temp_home" "$log_file" <<'PY'
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+log = Path(sys.argv[2]).read_text(errors="replace")
+
+if (home / ".claude" / "skills" / "agent-tickets" / "SKILL.md").exists():
+    raise SystemExit("fresh-install validation failed: Claude skill was installed without ~/.claude")
+if (home / ".codex" / "skills" / "agent-tickets" / "SKILL.md").exists():
+    raise SystemExit("fresh-install validation failed: Codex skill was installed without ~/.codex")
+if "skipped " not in log or ".claude/skills/agent-tickets/SKILL.md" not in log:
+    raise SystemExit("fresh-install validation failed: missing explicit Claude skip")
+if "skipped " not in log or ".codex/skills/agent-tickets/SKILL.md" not in log:
+    raise SystemExit("fresh-install validation failed: missing explicit Codex skip")
+if "claude: ~/.claude not present — skipped" not in log:
+    raise SystemExit("fresh-install validation failed: missing Claude hook skip")
+if "codex: ~/.codex not present — skipped" not in log:
+    raise SystemExit("fresh-install validation failed: missing Codex hook skip")
+
+print("fresh-install no-provider validation: ok")
+PY
+
+  echo "==> $label: ok"
+}
+
 if [ "$MODE" = "all" ] || [ "$MODE" = "linux-no-docker" ]; then
   run_no_docker_lane "linux-no-docker"
+  run_no_provider_lane "linux-no-providers"
 fi
 
 if [ "$MODE" = "all" ] || [ "$MODE" = "wsl-no-docker" ]; then

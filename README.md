@@ -121,11 +121,11 @@ bash scripts/install.sh --check
 ```
 agent-tickets/                          # <- dev / source of truth (this folder, in Dropbox)
   bin/agent-ticket        # the CLI agents use            -> installed as a real copy to ~/.local/bin/agent-ticket
-  skill/SKILL.md          # agent skill                   -> installed as real copies to ~/.claude and ~/.codex skills
+  skill/SKILL.md          # agent skill                   -> installed as real copies to existing ~/.claude and ~/.codex skills
   docker-compose.yml      # Kanboard container def (pinned version) -> copied to ~/.config/agent-tickets/docker-compose.yml
   config.example.json     # token-less template           -> seeds ~/.config/agent-tickets/config.json (only if missing)
   bootstrap-board.py      # idempotently creates the project + columns + categories in Kanboard, writes project_id to config
-  install.sh              # roll out onto a machine (idempotent; copies, doesn't symlink; installs skill+CLI for Claude Code AND Codex, registers notify hooks, runs bootstrap once a token is set)
+  install.sh              # roll out onto a machine (idempotent; copies, doesn't symlink; installs CLI plus Claude Code/Codex skills and hooks when those provider homes exist, runs bootstrap once a token is set)
   install-windows.bat     # native Windows installer entrypoint
   scripts/install-windows.ps1    # PowerShell implementation for native Windows install
   scripts/notify-hook.sh        # agent-neutral hook: surfaces open tickets for the repo the agent is in -> ~/.config/agent-tickets/notify-hook.sh
@@ -137,7 +137,7 @@ agent-tickets/                          # <- dev / source of truth (this folder,
   .gitignore              # if ever git-tracked: never commit data/ or the real config
 ```
 
-After install, the *live* system is entirely under `~/.local/bin`, `~/.claude/skills`, `~/.codex/skills`, `~/.config/agent-tickets`, and `~/kanboard-data` — independent of this folder for normal ticket operations. `~/.config/agent-tickets/source.json` is non-secret provenance metadata for `agent-ticket source-info`; if this source folder is missing, the CLI still works but source diagnostics report it as missing.
+After install, the *live* system is entirely under `~/.local/bin`, existing provider skill/config directories such as `~/.claude/skills` and `~/.codex/skills`, `~/.config/agent-tickets`, and `~/kanboard-data` — independent of this folder for normal ticket operations. `~/.config/agent-tickets/source.json` is non-secret provenance metadata for `agent-ticket source-info`; if this source folder is missing, the CLI still works but source diagnostics report it as missing.
 
 ## Lives OUTSIDE this folder (on purpose — this folder is in Dropbox)
 
@@ -229,7 +229,7 @@ This command does not contact Kanboard and does not need the API token. It repor
 
 ## Agents noticing tickets (cross-agent)
 
-The skill works for **both Claude Code and Codex** — `install.sh` copies `skill/SKILL.md` into `~/.claude/skills/agent-tickets/` *and* `~/.codex/skills/agent-tickets/` (same format), and the `agent-ticket` CLI is the same binary for any agent.
+The skill works for **both Claude Code and Codex**. When their user-level config directories already exist, `install.sh` copies `skill/SKILL.md` into `~/.claude/skills/agent-tickets/` and `~/.codex/skills/agent-tickets/` (same format), and the `agent-ticket` CLI is the same binary for any agent. If a provider is not installed yet and its user-level directory is absent, the installer prints an explicit skip for that provider; re-run the installer after installing that provider.
 
 So agents don't have to *remember* to look, `install.sh` also registers a **notify hook** (`scripts/notify-hook.sh`, installed to `~/.config/agent-tickets/`) that surfaces open tickets for the repo the agent is working in:
 
