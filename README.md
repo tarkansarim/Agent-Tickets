@@ -12,6 +12,13 @@ track the fix through closeout. It is built for environments where many
 repositories work together tightly, each repo may have its own owner agent, and
 work often crosses repo boundaries.
 
+Think of it as the local, agent-operated counterpart to team issue trackers
+such as Jira, Linear, GitHub Issues, or Kanboard itself. Those systems coordinate
+human teams, product backlogs, sprint work, and external project reporting;
+Agent Tickets coordinates AI coding agents working across a local multi-repo
+environment, with machine-friendly routing, guarded owner-agent contact, and
+closeout evidence built into the workflow.
+
 Use it when one repo's agent needs another repo's agent to fix a bug, implement
 a supporting feature, repair setup/docs, investigate an integration break, or
 unblock a dependent workflow. The ticket becomes the durable handoff: what is
