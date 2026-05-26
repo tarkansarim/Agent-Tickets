@@ -6,10 +6,11 @@ Kanboard API configuration, and the companion Agent-Terminal-Contact dependency;
 an agent can check those pieces, run the right installer for your OS, and
 escalate when a prerequisite needs your approval.
 
-`Agent Tickets` is a local cross-repo dependency management and agent
-coordination system for Claude Code and Codex agents. It is built for
-environments where many repositories work together tightly, each repo may have
-its own owner agent, and work often crosses repo boundaries.
+`Agent Tickets` is an agent ticket filing system for Claude Code and Codex:
+agents file structured tickets, route them to the repo that owns the work, and
+track the fix through closeout. It is built for environments where many
+repositories work together tightly, each repo may have its own owner agent, and
+work often crosses repo boundaries.
 
 Use it when one repo's agent needs another repo's agent to fix a bug, implement
 a supporting feature, repair setup/docs, investigate an integration break, or
