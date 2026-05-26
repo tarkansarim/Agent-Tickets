@@ -1,3 +1,5 @@
+![Agent Tickets banner](assets/agent-tickets-banner.png)
+
 # Agent Tickets
 
 Recommended setup path: let your Claude Code or Codex coding agent drive this
