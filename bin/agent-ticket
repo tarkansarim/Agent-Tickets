@@ -1855,7 +1855,9 @@ def severity_tag(tags):
 
 def resolve_repo_path(cfg, name):
     """Find the SOURCE repo dir for a project tag by checking each configured
-    repo_root for a <name> subdir; first hit wins. Returns an absolute path or None.
+    repo_root for a <name> subdir; first hit wins. If no exact path exists,
+    fall back to one case-insensitive directory-name match under each root.
+    Returns an absolute path or None.
     The project name must be a single directory basename — no path separators, no
     `.`/`..`, no leading dot — so a crafted tag like `project:../other` (or
     `project:/etc`) can't escape repo_roots."""
@@ -1869,6 +1871,23 @@ def resolve_repo_path(cfg, name):
         # under repo_roots pointing elsewhere does NOT count.
         if os.path.isdir(cand_real) and (cand_real == root_real or cand_real.startswith(root_real + os.sep)):
             return cand_real
+        try:
+            entries = os.listdir(root_real)
+        except OSError:
+            continue
+        folded = name.casefold()
+        matches = []
+        for entry in entries:
+            if entry.casefold() != folded:
+                continue
+            entry_real = os.path.realpath(os.path.join(root_real, entry))
+            if os.path.isdir(entry_real) and (entry_real == root_real or entry_real.startswith(root_real + os.sep)):
+                matches.append(entry_real)
+        unique = sorted(set(matches))
+        if len(unique) == 1:
+            return unique[0]
+        if len(unique) > 1:
+            return None
     return None
 
 
@@ -4082,7 +4101,8 @@ def cmd_tag(cfg, args):
     tags -= set(args.remove or [])
     _ok(rpc(cfg, "setTaskTags", {"project_id": cfg["project_id"], "task_id": args.id, "tags": sorted(tags)}),
         "set tags on #%s" % args.id)
-    out(args, {"tags": sorted(tags)}, "#%s tags: %s" % (args.id, ", ".join(_san(x) for x in sorted(tags)) or "-"))
+    stored_tags = task_tags(cfg, args.id)
+    out(args, {"tags": stored_tags}, "#%s tags: %s" % (args.id, ", ".join(_san(x) for x in stored_tags) or "-"))
 
 
 def _dispatch_message(cfg, task_id, pname, title):

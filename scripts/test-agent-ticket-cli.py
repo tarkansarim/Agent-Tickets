@@ -2578,6 +2578,88 @@ class AgentTicketCliTests(unittest.TestCase):
         self.assertIsNone(module.fcntl)
         self.assertIs(module.msvcrt, dummy_msvcrt)
 
+    def test_resolve_repo_path_accepts_single_case_insensitive_directory_match(self):
+        root = pathlib.Path(self.tmpdir.name) / "repos"
+        repo = root / "Reply-Verbosity"
+        repo.mkdir(parents=True)
+
+        resolved = self.cli.resolve_repo_path({"repo_roots": [str(root)]}, "reply-verbosity")
+
+        self.assertEqual(str(repo.resolve()), resolved)
+
+    def test_resolve_repo_path_prefers_exact_case_match(self):
+        root = pathlib.Path(self.tmpdir.name) / "repos"
+        exact = root / "reply-verbosity"
+        alternate = root / "Reply-Verbosity"
+        exact.mkdir(parents=True)
+        alternate.mkdir()
+
+        resolved = self.cli.resolve_repo_path({"repo_roots": [str(root)]}, "reply-verbosity")
+
+        self.assertEqual(str(exact.resolve()), resolved)
+
+    def test_resolve_repo_path_rejects_ambiguous_case_insensitive_matches(self):
+        root = pathlib.Path(self.tmpdir.name) / "repos"
+        (root / "Reply-Verbosity").mkdir(parents=True)
+        (root / "reply-verbosity").mkdir()
+
+        resolved = self.cli.resolve_repo_path({"repo_roots": [str(root)]}, "REPLY-VERBOSITY")
+
+        self.assertIsNone(resolved)
+
+    def test_tag_command_reports_stored_tags_after_kanboard_normalization(self):
+        calls = []
+
+        def fake_task_tags(cfg, tid):
+            calls.append(tid)
+            if len(calls) == 1:
+                return ["project:reply-verbosity", "p2"]
+            return ["project:reply-verbosity", "p2", "agent:codex"]
+
+        def fake_rpc(cfg, method, params=None):
+            self.assertEqual("setTaskTags", method)
+            self.assertIn("project:Reply-Verbosity", params["tags"])
+            return True
+
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value={"id": 219}), \
+             mock.patch.object(self.cli, "task_tags", side_effect=fake_task_tags), \
+             mock.patch.object(self.cli, "rpc", side_effect=fake_rpc), \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_tag(
+                {"project_id": 1},
+                argparse.Namespace(
+                    id=219,
+                    add=["project:Reply-Verbosity", "agent:codex"],
+                    remove=[],
+                    json=False,
+                ),
+            )
+
+        self.assertIn("project:reply-verbosity", out.getvalue())
+        self.assertNotIn("project:Reply-Verbosity", out.getvalue())
+
+    def test_supervise_batch_routes_lowercase_project_tag_to_uppercase_repo_directory(self):
+        root = pathlib.Path(self.tmpdir.name) / "repos"
+        repo = root / "Reply-Verbosity"
+        repo.mkdir(parents=True)
+        tasks = [{"id": 218, "title": "Route mixed case repo", "column_id": 1, "category_id": 1, "is_active": 1}]
+
+        with mock.patch.object(self.cli, "_all_tasks", return_value=tasks), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:reply-verbosity", "p2"]), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "category_name", return_value="bug"):
+            groups, skipped = self.cli._batch_collect_ticket_groups(
+                {"endpoint": "http://kanboard.invalid/jsonrpc.php", "repo_roots": [str(root)]},
+                self.batch_args(),
+            )
+
+        self.assertEqual([], skipped)
+        self.assertEqual(1, len(groups))
+        self.assertEqual(str(repo.resolve()), groups[0]["repo"])
+        self.assertEqual("Reply-Verbosity", groups[0]["session_key"])
+        self.assertEqual("reply-verbosity", groups[0]["project"])
+
     def test_supervise_batch_groups_same_repo_queue_and_skips_default_refusals(self):
         tasks = [
             {"id": 70, "title": "P1 demo", "column_id": 1, "category_id": 1, "is_active": 1},
