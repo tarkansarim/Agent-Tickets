@@ -19,6 +19,14 @@ Agent Tickets coordinates AI coding agents working across a local multi-repo
 environment, with machine-friendly routing, guarded owner-agent contact, and
 closeout evidence built into the workflow.
 
+The workflow is designed to be mostly autonomous once the system is installed.
+The user should not need to babysit every handoff: the active agent files the
+ticket, explains when routing or supervised resolution makes sense, asks for
+confirmation before contacting or launching an owner agent, and can then poll
+the ticket while the owner agent works. The user stays in the approval loop for
+cross-agent routing decisions, but does not have to manually relay status
+between repos.
+
 Use it when one repo's agent needs another repo's agent to fix a bug, implement
 a supporting feature, repair setup/docs, investigate an integration break, or
 unblock a dependent workflow. The ticket becomes the durable handoff: what is
