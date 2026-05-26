@@ -574,6 +574,147 @@ class AgentTicketCliTests(unittest.TestCase):
         tmux.assert_not_called()
         audit.assert_not_called()
 
+    def test_supervise_defer_same_owner_same_repo_claim_for_different_ticket(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                claim_id="claim-demo",
+                owner_id="current-supervisor",
+                ticket_ids=[203],
+                repo="/tmp/demo",
+                worker_session="owner-demo-203",
+            ),
+        })
+        task = {"id": 204, "title": "Second demo ticket", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+        args = argparse.Namespace(
+            id=204, provider=None, session=None, session_prefix="owner", full_permission=True,
+            message="", dry_run=False, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("deferred", result["status"])
+        self.assertEqual("repo already supervised", result["reason"])
+        self.assertEqual([203], result["active_supervision"][0]["ticket_ids"])
+        self.assertTrue(result["active_supervision"][0]["owned_by_current"])
+        self.assertIn("owner-demo-203", result["detail"])
+        contact.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_called_once()
+
+    def test_supervise_dry_run_does_not_comment_when_same_repo_claim_deferred(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                claim_id="claim-demo",
+                owner_id="current-supervisor",
+                ticket_ids=[203],
+                repo="/tmp/demo",
+                worker_session="owner-demo-203",
+            ),
+        })
+        task = {"id": 204, "title": "Second demo ticket", "column_id": 1, "swimlane_id": 1, "is_active": 1}
+        args = argparse.Namespace(
+            id=204, provider=None, session=None, session_prefix="owner", full_permission=True,
+            message="", dry_run=True, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="New"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_agent_contact") as contact, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("deferred", result["status"])
+        contact.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_not_called()
+
+    def test_supervise_acquire_defer_same_repo_claim_created_after_preflight(self):
+        self.write_supervision_claims({
+            "claim-demo": self.active_supervision_claim(
+                claim_id="claim-demo",
+                owner_id="current-supervisor",
+                ticket_ids=[203],
+                repo="/tmp/demo",
+                worker_session="owner-demo-203",
+            ),
+        })
+        task = {"id": 204, "title": "Second demo ticket", "column_id": 2, "swimlane_id": 1, "is_active": 1}
+        args = argparse.Namespace(
+            id=204, provider=None, session=None, session_prefix="owner", full_permission=False,
+            message="", dry_run=False, no_tool_ticket=False, poll_interval=0, max_polls=0,
+            strict_closeout=False, require_clean=False, require_validation=False,
+            require_commit=False, require_install=False, json=True, watch_origin=False,
+            supervisor_id="current-supervisor", supervision_ttl_hours=1,
+            adopt_supervision=False, steal_supervision=False, force_supervision=False,
+        )
+        out = io.StringIO()
+        empty_preflight = {
+            "owner_id": "current-supervisor",
+            "blocked": False,
+            "active_claims": [],
+            "conflicting_claims": [],
+            "owned_claims": [],
+            "stale_claims": [],
+            "override": False,
+        }
+        contactable = [{"provider": "codex", "session": "owner-demo-204", "probe": {"ok": True}}]
+        with mock.patch.object(self.cli, "get_task_in_project", return_value=task), \
+             mock.patch.object(self.cli, "task_tags", return_value=["project:demo"]), \
+             mock.patch.object(self.cli, "column_name", return_value="Triaging"), \
+             mock.patch.object(self.cli, "_resolve_ticket_repo", return_value=("demo", "/tmp/demo")), \
+             mock.patch.object(self.cli, "_supervision_preflight", return_value=empty_preflight), \
+             mock.patch.object(self.cli, "_contactable_providers", return_value=(contactable, [])), \
+             mock.patch.object(self.cli, "_agent_contact") as send, \
+             mock.patch.object(self.cli, "_agent_tmux") as tmux, \
+             mock.patch.object(self.cli, "audit_comment") as audit, \
+             mock.patch("sys.stdout", new=out):
+            self.cli.cmd_supervise({
+                "project_id": 1,
+                "repo_roots": ["/tmp"],
+                "endpoint": "http://127.0.0.1:8765/jsonrpc.php",
+            }, args)
+
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual("deferred", result["status"])
+        self.assertEqual("repo already supervised", result["reason"])
+        self.assertEqual([203], result["active_supervision"][0]["ticket_ids"])
+        send.assert_not_called()
+        tmux.assert_not_called()
+        audit.assert_called_once()
+
     def test_supervise_after_claim_release_launches_fresh_not_latest(self):
         self.write_supervision_claims({
             "claim-demo": self.active_supervision_claim(
@@ -1566,6 +1707,9 @@ class AgentTicketCliTests(unittest.TestCase):
         result = json.loads(out.getvalue())
         self.assertTrue(result["ok"])
         self.assertEqual("routed", result["status"])
+        self.assertEqual("polling_stopped", result["result"])
+        self.assertEqual("limit_reached", result["polling"]["status"])
+        self.assertEqual("worker still running", result["detail"].split("; ", 1)[1])
         self.assertEqual("contact", result["route"]["mode"])
         self.assertEqual("owner-agent-tickets", result["route"]["session"])
         self.assertIn(("codex", True, "owner-agent-tickets"), contact_calls)

@@ -76,15 +76,16 @@ Re-run `install.sh` after source changes to roll out updates.
 
 Recent changes:
 
+- `2026-05-26` — Serialized same-repo single-ticket supervision and clarified polling-limit output.
 - `bb15d02` — Clarified Claude install policy and hardened ticket skill discovery for natural repo-agent ticket requests.
 - `cc03512` — Added fresh-home Claude install coverage for the installer and hooks.
 - `8c31b8b` — Replaced the README banner with the correct JPG asset.
 - `964f386` — Added the README banner image.
-- `7ce854c` — Documented the mostly autonomous ticket workflow.
 
 <details>
 <summary>Show older changes</summary>
 
+- `7ce854c` — Documented the mostly autonomous ticket workflow.
 - `0950458` — Compared Agent Tickets to issue trackers such as Jira, Linear, GitHub Issues, and Kanboard.
 - `25a13bc` — Led the README description with the ticket filing purpose.
 - `6971916` — Switched the README display name to Agent Tickets.

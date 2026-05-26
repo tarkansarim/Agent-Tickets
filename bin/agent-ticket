@@ -945,6 +945,14 @@ def _supervision_claim_detail(claims):
     return "; ".join(parts) or "active supervision claim exists"
 
 
+def _owned_same_repo_claims_for_new_ticket(supervision_preflight, ticket_id):
+    ticket_id = int(ticket_id)
+    return [
+        claim for claim in (supervision_preflight or {}).get("owned_claims") or []
+        if ticket_id not in _supervision_ticket_ids(claim.get("ticket_ids") or [])
+    ]
+
+
 def _supervision_worker_identities(supervision_preflight):
     identities = set()
     for claim in (supervision_preflight or {}).get("owned_claims") or []:
@@ -1063,9 +1071,11 @@ def _find_owned_overlapping_claim(store, repo, ticket_ids, owner_id, include_sta
     return None
 
 
-def _acquire_supervision_claim(args, command, repo, project, projects, ticket_ids, route=None):
+def _acquire_supervision_claim(args, command, repo, project, projects, ticket_ids, route=None,
+                               block_owned_new_tickets=False):
     owner_id = _supervision_owner_id(args)
     now = time.time()
+    wanted_tickets = set(_supervision_ticket_ids(ticket_ids))
     fd = _lock_supervision_store()
     try:
         store = _load_supervision_store(strict=True)
@@ -1083,6 +1093,9 @@ def _acquire_supervision_claim(args, command, repo, project, projects, ticket_id
             store, repo, ticket_ids, owner_id,
             include_stale=bool(getattr(args, "adopt_supervision", False) or getattr(args, "steal_supervision", False)),
         )
+        if (existing and block_owned_new_tickets and not getattr(args, "force_supervision", False)
+                and not wanted_tickets.issubset(set(_supervision_ticket_ids(existing.get("ticket_ids") or [])))):
+            return None, [_public_supervision_claim(existing, owner_id, now)]
         claim = _build_supervision_claim(args, command, repo, project, projects, ticket_ids, route=route, existing=existing, now=now)
         store["claims"][claim["claim_id"]] = claim
         _save_supervision_store(store)
@@ -3613,6 +3626,25 @@ def cmd_supervise(cfg, args):
         out(args, result, "supervise #%s blocked: already supervised (%s)" % (args.id, result["detail"]))
         return
 
+    owned_repo_claims = _owned_same_repo_claims_for_new_ticket(supervision_preflight, args.id)
+    if owned_repo_claims and not getattr(args, "force_supervision", False):
+        detail = _supervision_claim_detail(owned_repo_claims)
+        result = {
+            "ok": False,
+            "status": "deferred",
+            "reason": "repo already supervised",
+            "detail": detail,
+            "active_supervision": owned_repo_claims,
+        }
+        if not getattr(args, "dry_run", False):
+            audit_comment(
+                cfg,
+                args.id,
+                "supervise deferred: repo already has an active owner worker/session (%s)" % detail,
+            )
+        out(args, result, "supervise #%s deferred: repo already supervised (%s)" % (args.id, detail))
+        return
+
     launch_message = _supervision_message(cfg, args.id, pname, title, args)
     contact_message = _supervision_contact_message(cfg, args.id, pname, title, args)
     requested_provider = args.provider
@@ -3772,8 +3804,25 @@ def cmd_supervise(cfg, args):
                 (" (%s)" % note) if note else ""))
         return
     claim, conflicts = _acquire_supervision_claim(
-        args, "supervise", repo, pname, [pname], [args.id], route=route)
+        args, "supervise", repo, pname, [pname], [args.id], route=route,
+        block_owned_new_tickets=True)
     if conflicts:
+        if any(c.get("owned_by_current") for c in conflicts):
+            detail = _supervision_claim_detail(conflicts)
+            result = {
+                "ok": False,
+                "status": "deferred",
+                "reason": "repo already supervised",
+                "detail": detail,
+                "active_supervision": conflicts,
+            }
+            audit_comment(
+                cfg,
+                args.id,
+                "supervise deferred: repo already has an active owner worker/session (%s)" % detail,
+            )
+            out(args, result, "supervise #%s deferred: repo already supervised (%s)" % (args.id, detail))
+            return
         result = {
             "ok": False,
             "status": "blocked",
@@ -3880,9 +3929,15 @@ def cmd_supervise(cfg, args):
             break
         time.sleep(args.poll_interval)
 
-    result = {"ok": True, "status": "routed", "route": route,
-              "detail": "owner was routed; ticket still open after polling limit"}
-    out(args, result, "supervise #%s routed to %s session %s; ticket still open after polling limit" % (
+    result = {
+        "ok": True,
+        "status": "routed",
+        "result": "polling_stopped",
+        "route": route,
+        "polling": {"status": "limit_reached", "worker_state": "still_running"},
+        "detail": "polling limit reached; worker still running",
+    }
+    out(args, result, "supervise #%s routed to %s session %s; polling limit reached (worker still running)" % (
         args.id, route["provider"], route["session"]))
 
 
@@ -4145,7 +4200,7 @@ def _add_supervision_claim_args(sp):
     sp.add_argument("--steal-supervision", action="store_true",
                     help="allow takeover of stale supervision claims; active other-owner claims still need --force-supervision")
     sp.add_argument("--force-supervision", action="store_true",
-                    help="override active other-owner supervision claims instead of failing closed")
+                    help="override active supervision claims and same-repo serialization instead of failing closed")
 
 
 def main():
